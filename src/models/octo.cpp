@@ -18,9 +18,12 @@
 #endif
 #include "gguf.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cfloat>
 #include <cstring>
 #include <cmath>
 #include <fstream>
@@ -222,6 +225,11 @@ struct NpyF32 {
     std::vector<float> data;
 };
 
+struct NpyBool {
+    std::vector<int64_t> shape;
+    std::vector<uint8_t> data;
+};
+
 static bool read_file_all(const std::string& path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
@@ -350,6 +358,62 @@ static bool parse_npy_f32(const std::string& path, NpyF32& out) {
     return true;
 }
 
+static bool parse_npy_bool(const std::string& path, NpyBool& out) {
+    std::vector<uint8_t> bytes;
+    if (!read_file_all(path, bytes)) return false;
+    if (bytes.size() < 16 || std::memcmp(bytes.data(), "\x93NUMPY", 6) != 0) {
+        std::fprintf(stderr, "vla(octo): %s is not a .npy file\n", path.c_str());
+        return false;
+    }
+    const int major = bytes[6];
+    size_t pos = 8;
+    uint32_t hlen = 0;
+    if (major == 1) {
+        hlen = (uint32_t) bytes[pos] | ((uint32_t) bytes[pos + 1] << 8);
+        pos += 2;
+    } else if (major == 2 || major == 3) {
+        hlen = (uint32_t) bytes[pos] | ((uint32_t) bytes[pos + 1] << 8) |
+               ((uint32_t) bytes[pos + 2] << 16) | ((uint32_t) bytes[pos + 3] << 24);
+        pos += 4;
+    } else {
+        std::fprintf(stderr, "vla(octo): unsupported .npy version %d in %s\n", major, path.c_str());
+        return false;
+    }
+    if (pos + hlen > bytes.size()) return false;
+    const std::string header(reinterpret_cast<const char *>(bytes.data() + pos), hlen);
+    pos += hlen;
+    if (header.find("'descr': '|b1'") == std::string::npos &&
+        header.find("\"descr\": \"|b1\"") == std::string::npos) {
+        std::fprintf(stderr, "vla(octo): %s expected bool .npy\n", path.c_str());
+        return false;
+    }
+    if (header.find("'fortran_order': False") == std::string::npos &&
+        header.find("\"fortran_order\": False") == std::string::npos) {
+        std::fprintf(stderr, "vla(octo): %s expected C-order .npy\n", path.c_str());
+        return false;
+    }
+    const size_t l = header.find('(');
+    const size_t r = header.find(')', l == std::string::npos ? 0 : l);
+    if (l == std::string::npos || r == std::string::npos) return false;
+    out.shape.clear();
+    size_t s = l + 1;
+    while (s < r) {
+        while (s < r && (header[s] == ' ' || header[s] == ',')) ++s;
+        size_t e = s;
+        while (e < r && header[e] >= '0' && header[e] <= '9') ++e;
+        if (e > s) out.shape.push_back(std::strtoll(header.substr(s, e - s).c_str(), nullptr, 10));
+        s = e + 1;
+    }
+    int64_t ne = 1;
+    for (int64_t d : out.shape) ne *= d;
+    if (pos + (size_t) ne > bytes.size()) {
+        std::fprintf(stderr, "vla(octo): %s truncated .npy payload\n", path.c_str());
+        return false;
+    }
+    out.data.assign(bytes.begin() + (ptrdiff_t) pos, bytes.begin() + (ptrdiff_t) pos + ne);
+    return true;
+}
+
 static bool write_f32_dump(const std::string& dir,
                            const char * name,
                            const std::vector<float>& data,
@@ -378,6 +442,24 @@ static bool write_f32_dump(const std::string& dir,
     return (bool) f;
 }
 
+static bool write_bool_dump(const std::string& dir,
+                            const char * name,
+                            const std::vector<uint8_t>& data,
+                            const std::vector<int64_t>& shape,
+                            std::ofstream& manifest) {
+    const std::string path = dir + "/" + name + ".bool";
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        std::fprintf(stderr, "vla(octo): cannot write %s\n", path.c_str());
+        return false;
+    }
+    f.write(reinterpret_cast<const char *>(data.data()), (std::streamsize) data.size());
+    manifest << name << " " << path << " bool";
+    for (int64_t d : shape) manifest << " " << d;
+    manifest << "\n";
+    return (bool) f;
+}
+
 struct OctoObsWeights {
     std::vector<float> conv_w[4], conv_b[4], gn_w[4], gn_b[4];
     std::vector<float> patch_w, patch_b, proj_w, proj_b, pos;
@@ -385,6 +467,18 @@ struct OctoObsWeights {
 
 struct OctoLanguageWeights {
     std::vector<float> proj_w, proj_b, pos;
+};
+
+struct OctoBlockWeights {
+    std::vector<float> attn_norm_w, attn_norm_b;
+    std::vector<float> qkv_w, qkv_b, attn_o_w, attn_o_b;
+    std::vector<float> ffn_norm_w, ffn_norm_b;
+    std::vector<float> ffn_up_w, ffn_up_b, ffn_down_w, ffn_down_b;
+};
+
+struct OctoTransformerWeights {
+    std::array<OctoBlockWeights, 12> blocks;
+    std::vector<float> output_norm_w, output_norm_b, readout_pos;
 };
 
 static bool read_obs_weights(gguf_reader& g, const char * view, OctoObsWeights& w) {
@@ -409,6 +503,28 @@ static bool read_language_weights(gguf_reader& g, OctoLanguageWeights& w) {
     w.proj_b = g.read_f32("octo.task.language.proj.bias");
     w.pos    = g.read_f32("octo.task.language.pos_embd");
     return !w.proj_w.empty() && !w.proj_b.empty() && !w.pos.empty();
+}
+
+static bool read_transformer_weights(gguf_reader& g, OctoTransformerWeights& w) {
+    char name[160];
+    for (int i = 0; i < 12; ++i) {
+        OctoBlockWeights& b = w.blocks[(size_t) i];
+        auto read = [&](const char * leaf, std::vector<float>& dst) {
+            std::snprintf(name, sizeof(name), "octo.blk.%d.%s", i, leaf);
+            dst = g.read_f32(name);
+            return !dst.empty();
+        };
+        if (!read("attn_norm.weight", b.attn_norm_w) || !read("attn_norm.bias", b.attn_norm_b) ||
+            !read("attn_qkv.weight", b.qkv_w) || !read("attn_qkv.bias", b.qkv_b) ||
+            !read("attn_o.weight", b.attn_o_w) || !read("attn_o.bias", b.attn_o_b) ||
+            !read("ffn_norm.weight", b.ffn_norm_w) || !read("ffn_norm.bias", b.ffn_norm_b) ||
+            !read("ffn_up.weight", b.ffn_up_w) || !read("ffn_up.bias", b.ffn_up_b) ||
+            !read("ffn_down.weight", b.ffn_down_w) || !read("ffn_down.bias", b.ffn_down_b)) return false;
+    }
+    w.output_norm_w = g.read_f32("octo.output_norm.weight");
+    w.output_norm_b = g.read_f32("octo.output_norm.bias");
+    w.readout_pos   = g.read_f32("octo.readout.action.pos_embd");
+    return !w.output_norm_w.empty() && !w.output_norm_b.empty() && w.readout_pos.size() >= 2 * 384;
 }
 
 static void standardize_conv_weight(const std::vector<float>& src,
@@ -680,6 +796,286 @@ static bool run_language_graph(const OctoLanguageWeights& w,
     return true;
 }
 
+enum class OctoTokenKind { TASK, OBS, READOUT };
+
+struct OctoTokenMetadata {
+    OctoTokenKind kind;
+    int timestep;
+};
+
+struct OctoTransformerResult {
+    std::vector<float> input;
+    std::vector<uint8_t> blocked_mask;
+    std::array<std::vector<float>, 12> block_outputs;
+    std::vector<float> output;
+    std::vector<float> task_language;
+    std::vector<float> obs_primary;
+    std::vector<float> obs_wrist;
+    std::vector<float> obs_task_language;
+    std::vector<float> readout_action;
+};
+
+static bool assemble_transformer_input(const std::vector<float>& task_language,
+                                       const std::vector<float>& obs_primary,
+                                       const std::vector<float>& obs_wrist,
+                                       const std::vector<float>& repeated_language,
+                                       const std::vector<float>& readout_pos,
+                                       std::vector<float>& input) {
+    constexpr int hidden = 384;
+    constexpr int seq = 690;
+    constexpr int step_tokens = 337;
+    if (task_language.size() != (size_t) 16 * hidden ||
+        obs_primary.size() != (size_t) 2 * 256 * hidden ||
+        obs_wrist.size() != (size_t) 2 * 64 * hidden ||
+        repeated_language.size() != (size_t) 2 * 16 * hidden ||
+        readout_pos.size() < (size_t) 2 * hidden) {
+        std::fprintf(stderr, "vla(octo): invalid tensor size while assembling block transformer input\n");
+        return false;
+    }
+    input.assign((size_t) seq * hidden, 0.0f);
+    std::copy(task_language.begin(), task_language.end(), input.begin());
+    for (int t = 0; t < 2; ++t) {
+        const size_t dst = (size_t) (16 + t * step_tokens) * hidden;
+        std::copy_n(obs_primary.begin() + (size_t) t * 256 * hidden, (size_t) 256 * hidden, input.begin() + dst);
+        std::copy_n(obs_wrist.begin() + (size_t) t * 64 * hidden, (size_t) 64 * hidden, input.begin() + dst + (size_t) 256 * hidden);
+        std::copy_n(repeated_language.begin() + (size_t) t * 16 * hidden, (size_t) 16 * hidden,
+                    input.begin() + dst + (size_t) 320 * hidden);
+        std::copy_n(readout_pos.begin() + (size_t) t * hidden, hidden,
+                    input.begin() + dst + (size_t) 336 * hidden);
+    }
+    return true;
+}
+
+static bool build_transformer_mask(const NpyBool& task_valid,
+                                   const NpyBool& primary_valid,
+                                   const NpyBool& wrist_valid,
+                                   const NpyBool& timestep_valid,
+                                   std::vector<uint8_t>& blocked,
+                                   std::vector<float>& blocked_f32) {
+    constexpr int seq = 690;
+    constexpr int heads = 6;
+    constexpr int step_tokens = 337;
+    if (task_valid.shape != std::vector<int64_t>{1} ||
+        primary_valid.shape != std::vector<int64_t>({1, 2}) ||
+        wrist_valid.shape != std::vector<int64_t>({1, 2}) ||
+        timestep_valid.shape != std::vector<int64_t>({1, 2})) {
+        std::fprintf(stderr, "vla(octo): unexpected input pad-mask shape\n");
+        return false;
+    }
+
+    std::vector<OctoTokenMetadata> metadata;
+    std::vector<uint8_t> key_valid;
+    metadata.reserve(seq);
+    key_valid.reserve(seq);
+    for (int i = 0; i < 16; ++i) {
+        metadata.push_back({OctoTokenKind::TASK, -1});
+        key_valid.push_back(task_valid.data[0] != 0);
+    }
+    for (int t = 0; t < 2; ++t) {
+        const uint8_t timestep_ok = timestep_valid.data[(size_t) t] != 0;
+        for (int i = 0; i < 256; ++i) {
+            metadata.push_back({OctoTokenKind::OBS, t});
+            key_valid.push_back(timestep_ok && primary_valid.data[(size_t) t]);
+        }
+        for (int i = 0; i < 64; ++i) {
+            metadata.push_back({OctoTokenKind::OBS, t});
+            key_valid.push_back(timestep_ok && wrist_valid.data[(size_t) t]);
+        }
+        for (int i = 0; i < 16; ++i) {
+            metadata.push_back({OctoTokenKind::OBS, t});
+            key_valid.push_back(task_valid.data[0] != 0);
+        }
+        metadata.push_back({OctoTokenKind::READOUT, t});
+        key_valid.push_back(1);
+    }
+    if (metadata.size() != seq || key_valid.size() != seq || 16 + 2 * step_tokens != seq) return false;
+
+    const size_t plane = (size_t) seq * seq;
+    std::vector<uint8_t> blocked_one_head(plane, 0);
+    blocked_f32.assign(plane, 0.0f);
+    for (int q = 0; q < seq; ++q) {
+        const OctoTokenMetadata qm = metadata[(size_t) q];
+        for (int k = 0; k < seq; ++k) {
+            const OctoTokenMetadata km = metadata[(size_t) k];
+            bool allowed = false;
+            if (qm.kind == OctoTokenKind::TASK) {
+                allowed = km.kind == OctoTokenKind::TASK;
+            } else if (qm.kind == OctoTokenKind::OBS) {
+                allowed = km.kind == OctoTokenKind::TASK ||
+                          (km.kind == OctoTokenKind::OBS && km.timestep <= qm.timestep);
+            } else {
+                allowed = km.kind == OctoTokenKind::TASK ||
+                          (km.kind == OctoTokenKind::OBS && km.timestep <= qm.timestep) ||
+                          (km.kind == OctoTokenKind::READOUT && km.timestep <= qm.timestep);
+            }
+            const size_t index = (size_t) q * seq + k;
+            const bool is_blocked = !allowed || !key_valid[(size_t) k];
+            blocked_one_head[index] = is_blocked ? 1 : 0;
+            blocked_f32[index] = is_blocked ? 1.0f : 0.0f;
+        }
+    }
+    blocked.resize((size_t) heads * plane);
+    for (int h = 0; h < heads; ++h) {
+        std::copy(blocked_one_head.begin(), blocked_one_head.end(), blocked.begin() + (size_t) h * plane);
+    }
+    return true;
+}
+
+static bool run_transformer_graph(OctoTransformerWeights& w,
+                                  const std::vector<float>& input,
+                                  const std::vector<float>& blocked_mask,
+                                  OctoTransformerResult& result) {
+    constexpr int hidden = 384;
+    constexpr int ffn = 1536;
+    constexpr int heads = 6;
+    constexpr int head_dim = 64;
+    constexpr int seq = 690;
+    constexpr float ln_eps = 1e-6f;
+    constexpr float attn_scale = 0.125f;
+    if (input.size() != (size_t) hidden * seq || blocked_mask.size() != (size_t) seq * seq) return false;
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        std::fprintf(stderr, "vla(octo): ggml_backend_cpu_init failed for transformer graph\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, default_cpu_threads());
+    ggml_init_params gp = {(size_t) 32 * 1024 * 1024, nullptr, true};
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    std::vector<ggml_tensor *> tensors;
+    std::vector<std::vector<float>> payloads;
+    auto add_payload = [&](ggml_tensor * t, std::vector<float> data) {
+        tensors.push_back(t);
+        payloads.push_back(std::move(data));
+        return t;
+    };
+    auto make_1d_payload = [&](const char * name, int64_t ne0, std::vector<float>& data) {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0);
+        ggml_set_name(t, name);
+        return add_payload(t, std::move(data));
+    };
+    auto make_2d_payload = [&](const char * name, int64_t ne0, int64_t ne1, std::vector<float>& data) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+        ggml_set_name(t, name);
+        return add_payload(t, std::move(data));
+    };
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, seq);
+    ggml_set_name(x, "octo.block_transformer.input");
+    add_payload(x, input);
+    ggml_tensor * mask_blocked = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq, seq);
+    ggml_set_name(mask_blocked, "octo.block_transformer.blocked_mask");
+    add_payload(mask_blocked, blocked_mask);
+    ggml_tensor * mask = ggml_scale(ctx, ggml_repeat_4d(ctx, mask_blocked, seq, seq, heads, 1), -FLT_MAX);
+    ggml_set_name(mask, "octo.block_transformer.additive_mask");
+
+    std::array<ggml_tensor *, 12> block_out{};
+    char name[160];
+    for (int i = 0; i < 12; ++i) {
+        OctoBlockWeights& b = w.blocks[(size_t) i];
+        auto n1w = make_1d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.attn_norm.weight", i), name), hidden, b.attn_norm_w);
+        auto n1b = make_1d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.attn_norm.bias", i), name), hidden, b.attn_norm_b);
+        auto Wqkv = make_2d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.attn_qkv.weight", i), name), hidden, 3 * hidden, b.qkv_w);
+        auto bqkv = make_1d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.attn_qkv.bias", i), name), 3 * hidden, b.qkv_b);
+        auto Wo = make_2d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.attn_o.weight", i), name), hidden, hidden, b.attn_o_w);
+        auto bo = make_1d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.attn_o.bias", i), name), hidden, b.attn_o_b);
+        auto n2w = make_1d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.ffn_norm.weight", i), name), hidden, b.ffn_norm_w);
+        auto n2b = make_1d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.ffn_norm.bias", i), name), hidden, b.ffn_norm_b);
+        auto Wup = make_2d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.ffn_up.weight", i), name), hidden, ffn, b.ffn_up_w);
+        auto bup = make_1d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.ffn_up.bias", i), name), ffn, b.ffn_up_b);
+        auto Wdown = make_2d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.ffn_down.weight", i), name), ffn, hidden, b.ffn_down_w);
+        auto bdown = make_1d_payload((std::snprintf(name, sizeof(name), "octo.blk.%d.ffn_down.bias", i), name), hidden, b.ffn_down_b);
+
+        ggml_tensor * n1 = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, ln_eps), n1w), n1b);
+        ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, Wqkv, n1), bqkv);
+        ggml_tensor * q = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden, seq, qkv->nb[1], 0));
+        ggml_tensor * k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden, seq, qkv->nb[1], (size_t) hidden * qkv->nb[0]));
+        ggml_tensor * v = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden, seq, qkv->nb[1], (size_t) 2 * hidden * qkv->nb[0]));
+        ggml_tensor * Q = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, q, head_dim, heads, seq), 0, 2, 1, 3));
+        ggml_tensor * K = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, head_dim, heads, seq), 0, 2, 1, 3));
+        ggml_tensor * V = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, v, head_dim, heads, seq), 1, 2, 0, 3));
+        ggml_tensor * scores = ggml_mul_mat(ctx, K, Q);
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        ggml_tensor * probs = ggml_soft_max_ext(ctx, scores, mask, attn_scale, 0.0f);
+        ggml_tensor * attended = ggml_mul_mat(ctx, V, probs);
+        ggml_tensor * merged = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, attended, 0, 2, 1, 3)), hidden, seq);
+        ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, Wo, merged), bo);
+        ggml_tensor * residual = ggml_add(ctx, x, attn_out);
+        ggml_tensor * n2 = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, residual, ln_eps), n2w), n2b);
+        ggml_tensor * mlp = ggml_add(ctx, ggml_mul_mat(ctx, Wup, n2), bup);
+        mlp = ggml_gelu_erf(ctx, mlp);
+        mlp = ggml_add(ctx, ggml_mul_mat(ctx, Wdown, mlp), bdown);
+        x = ggml_add(ctx, residual, mlp);
+        std::snprintf(name, sizeof(name), "bt.blk%d.out", i);
+        ggml_set_name(x, name);
+        ggml_set_output(x);
+        block_out[(size_t) i] = x;
+    }
+
+    ggml_tensor * out_w = make_1d_payload("octo.output_norm.weight", hidden, w.output_norm_w);
+    ggml_tensor * out_b = make_1d_payload("octo.output_norm.bias", hidden, w.output_norm_b);
+    ggml_tensor * output = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, ln_eps), out_w), out_b);
+    ggml_set_name(output, "bt.output");
+    ggml_set_output(output);
+    ggml_tensor * split_task = ggml_cont(ctx, ggml_view_2d(ctx, output, hidden, 16, output->nb[1], 0));
+    ggml_tensor * split_primary = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 256, 2, output->nb[1], (size_t) 337 * output->nb[1], (size_t) 16 * output->nb[1]));
+    ggml_tensor * split_wrist = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 64, 2, output->nb[1], (size_t) 337 * output->nb[1], (size_t) 272 * output->nb[1]));
+    ggml_tensor * split_language = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 16, 2, output->nb[1], (size_t) 337 * output->nb[1], (size_t) 336 * output->nb[1]));
+    ggml_tensor * split_readout = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 1, 2, output->nb[1], (size_t) 337 * output->nb[1], (size_t) 352 * output->nb[1]));
+    for (ggml_tensor * t : {split_task, split_primary, split_wrist, split_language, split_readout}) ggml_set_output(t);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
+    ggml_build_forward_expand(graph, split_task);
+    ggml_build_forward_expand(graph, split_primary);
+    ggml_build_forward_expand(graph, split_wrist);
+    ggml_build_forward_expand(graph, split_language);
+    ggml_build_forward_expand(graph, split_readout);
+    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
+        std::fprintf(stderr, "vla(octo): transformer ggml_gallocr_alloc_graph failed\n");
+        if (gallocr) ggml_gallocr_free(gallocr);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        ggml_backend_tensor_set(tensors[i], payloads[i].data(), 0, ggml_nbytes(tensors[i]));
+    }
+    const ggml_status st = ggml_backend_graph_compute(backend, graph);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "vla(octo): transformer ggml_backend_graph_compute failed (%d)\n", (int) st);
+        ggml_gallocr_free(gallocr);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    for (int i = 0; i < 12; ++i) {
+        result.block_outputs[(size_t) i].resize((size_t) hidden * seq);
+        ggml_backend_tensor_get(block_out[(size_t) i], result.block_outputs[(size_t) i].data(), 0, ggml_nbytes(block_out[(size_t) i]));
+    }
+    auto get = [&](ggml_tensor * t, std::vector<float>& dst) {
+        dst.resize(ggml_nelements(t));
+        ggml_backend_tensor_get(t, dst.data(), 0, ggml_nbytes(t));
+    };
+    get(output, result.output);
+    get(split_task, result.task_language);
+    get(split_primary, result.obs_primary);
+    get(split_wrist, result.obs_wrist);
+    get(split_language, result.obs_task_language);
+    get(split_readout, result.readout_action);
+
+    ggml_gallocr_free(gallocr);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
 }  // namespace
 
 std::unique_ptr<ModelArchBase> octo_create(const std::string& mmproj_path,
@@ -792,15 +1188,17 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
         return false;
     }
 
-    std::vector<float> tok, proj, pos;
+    std::vector<float> tok, proj, pos, primary_pos, wrist_pos;
     if (!run_one_obs_tokenizer_graph(primary_w, primary_obs, primary_task, 256, 256, tok, proj, pos)) return false;
     if (!write_f32_dump(dump_dir, "obs.primary.tok",  tok,  {1, 2, 256, 512}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.primary.proj", proj, {1, 2, 256, 384}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.primary.pos",  pos,  {1, 2, 256, 384}, mf)) return false;
+    primary_pos = pos;
     if (!run_one_obs_tokenizer_graph(wrist_w, wrist_obs, wrist_task, 128, 64, tok, proj, pos)) return false;
     if (!write_f32_dump(dump_dir, "obs.wrist.tok",  tok,  {1, 2, 64, 512}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.wrist.proj", proj, {1, 2, 64, 384}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.wrist.pos",  pos,  {1, 2, 64, 384}, mf)) return false;
+    wrist_pos = pos;
     if (!t5_inject_path.empty()) {
         NpyF32 t5;
         if (!parse_npy_f32(t5_inject_path, t5)) return false;
@@ -811,6 +1209,33 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
         if (!write_f32_dump(dump_dir, "lang.proj",         lang_proj, {1, 16, 384}, mf)) return false;
         if (!write_f32_dump(dump_dir, "lang.pos",          lang_pos,  {1, 16, 384}, mf)) return false;
         if (!write_f32_dump(dump_dir, "repeated_language", repeated,  {1, 2, 16, 384}, mf)) return false;
+
+        OctoTransformerWeights transformer_w;
+        if (!read_transformer_weights(g, transformer_w)) return false;
+        NpyBool task_valid, primary_valid, wrist_valid, timestep_valid;
+        if (!parse_npy_bool(case_dir + "/tensors/input.task.pad_mask_dict.language_instruction.npy", task_valid) ||
+            !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_primary.npy", primary_valid) ||
+            !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_wrist.npy", wrist_valid) ||
+            !parse_npy_bool(case_dir + "/tensors/input.observation.timestep_pad_mask.npy", timestep_valid)) return false;
+
+        OctoTransformerResult bt;
+        if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, bt.input)) return false;
+        std::vector<float> blocked_mask;
+        if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, bt.blocked_mask, blocked_mask)) return false;
+        if (!write_f32_dump(dump_dir, "bt.input", bt.input, {1, 690, 384}, mf)) return false;
+        if (!write_bool_dump(dump_dir, "bt.mask", bt.blocked_mask, {6, 690, 690}, mf)) return false;
+        if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, bt)) return false;
+        for (int i = 0; i < 12; ++i) {
+            char boundary[32];
+            std::snprintf(boundary, sizeof(boundary), "bt.blk%d.out", i);
+            if (!write_f32_dump(dump_dir, boundary, bt.block_outputs[(size_t) i], {1, 690, 384}, mf)) return false;
+        }
+        if (!write_f32_dump(dump_dir, "bt.output", bt.output, {1, 690, 384}, mf)) return false;
+        if (!write_f32_dump(dump_dir, "bt.task_language", bt.task_language, {1, 16, 384}, mf)) return false;
+        if (!write_f32_dump(dump_dir, "bt.obs_primary", bt.obs_primary, {1, 2, 256, 384}, mf)) return false;
+        if (!write_f32_dump(dump_dir, "bt.obs_wrist", bt.obs_wrist, {1, 2, 64, 384}, mf)) return false;
+        if (!write_f32_dump(dump_dir, "bt.obs_task_language", bt.obs_task_language, {1, 2, 16, 384}, mf)) return false;
+        if (!write_f32_dump(dump_dir, "bt.readout_action", bt.readout_action, {1, 2, 1, 384}, mf)) return false;
     }
     return true;
 }

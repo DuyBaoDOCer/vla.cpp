@@ -17,14 +17,15 @@ target_include_directories(octo_parity_dump PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(octo_parity_dump PRIVATE vla_core)
 target_compile_options(octo_parity_dump PRIVATE -Wall -Wextra)
 if(Python3_FOUND AND DEFINED ENV{VLA_OCTO_GOLDEN_DIR})
-  foreach(OCTO_PARITY_CASE example_batch synthetic_zero synthetic_random second_timestep_padded)
+  foreach(OCTO_PARITY_CASE example_batch synthetic_zero synthetic_random second_timestep_padded wrist_valid_synthetic)
     if(EXISTS "$ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy")
       add_test(
-        NAME octo_tokenizer_parity_${OCTO_PARITY_CASE}
+        NAME octo_parity_${OCTO_PARITY_CASE}
         COMMAND ${CMAKE_COMMAND}
           -DCKPT=${CMAKE_SOURCE_DIR}/octo-small-1.5-f32.gguf
           -DCASE_DIR=$ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}
           -DT5_INJECT=$ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy
+          -DTRANSFORMER_TOL=2e-3
           -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity/${OCTO_PARITY_CASE}
           -DDUMPER=$<TARGET_FILE:octo_parity_dump>
           -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
