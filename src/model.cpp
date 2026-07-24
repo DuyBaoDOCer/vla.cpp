@@ -66,6 +66,7 @@ bool detect_arch_gguf(const std::string& path, Arch* out) {
         try_str("gr00t_n1_5.architecture", arch_str) ||
         try_str("gr00t_n1_6.architecture", arch_str) ||
         try_str("gr00t_n1_7.architecture", arch_str) ||
+        try_str("octo.architecture",       arch_str) ||
         try_str("bitvla.architecture",     arch_str) ||
         try_str("openvla_oft.architecture", arch_str) ||
         try_str("vla_jepa.architecture",   arch_str) ||
@@ -77,6 +78,8 @@ bool detect_arch_gguf(const std::string& path, Arch* out) {
         else if (arch_str == "gr00t_n1_5") { *out = Arch::GR00T_N1_5; ok = true; }
         else if (arch_str == "gr00t_n1_6") { *out = Arch::GR00T_N1_6; ok = true; }
         else if (arch_str == "gr00t_n1_7") { *out = Arch::GR00T_N1_7; ok = true; }
+        else if (arch_str == "octo" ||
+                 arch_str == "octo-small-1.5") { *out = Arch::OCTO;   ok = true; }
         else if (arch_str == "bitvla")     { *out = Arch::BITVLA;     ok = true; }
         else if (arch_str == "vla_adapter"){ *out = Arch::VLA_ADAPTER;ok = true; }
         else if (arch_str == "openvla_oft"){ *out = Arch::OPENVLA_OFT;ok = true; }
@@ -164,6 +167,10 @@ Model* model_load(const std::string& mmproj_path, const std::string& ckpt_path,
         case Arch::GR00T_N1_7:
             std::printf("vla: arch = gr00t_n1_7\n");
             impl = gr00t_n1_7_create(mmproj_path, ckpt_path, config_path);
+            break;
+        case Arch::OCTO:
+            std::printf("vla: arch = octo\n");
+            impl = octo_create(mmproj_path, ckpt_path, config_path);
             break;
         case Arch::BITVLA:
             std::printf("vla: arch = bitvla\n");

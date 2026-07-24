@@ -34,6 +34,7 @@ add_library(vla_core
     src/models/gr00tn1d5.cpp
     src/models/gr00tn1d6.cpp
     src/models/gr00tn1d7.cpp
+    src/models/octo.cpp
     src/models/bitvla.cpp
     src/models/vla_adapter.cpp
     src/models/openvla_oft.cpp
