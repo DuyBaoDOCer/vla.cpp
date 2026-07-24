@@ -355,80 +355,20 @@ static void standardize_conv_weight(const std::vector<float>& src,
     }
 }
 
-static void conv2d(const std::vector<float>& x, int ic, int ih, int iw,
-                   const std::vector<float>& w, const std::vector<float>& b,
-                   int oc, int kh, int kw, int stride, int pad,
-                   std::vector<float>& y, int& oh, int& ow) {
-    oh = (ih + 2 * pad - kh) / stride + 1;
-    ow = (iw + 2 * pad - kw) / stride + 1;
-    y.assign((size_t) oc * oh * ow, 0.0f);
-    for (int o = 0; o < oc; ++o) {
-        for (int yy = 0; yy < oh; ++yy) {
-            for (int xx = 0; xx < ow; ++xx) {
-                float acc = b[o];
-                for (int c = 0; c < ic; ++c) {
-                    for (int ky = 0; ky < kh; ++ky) {
-                        const int iy = yy * stride + ky - pad;
-                        if (iy < 0 || iy >= ih) continue;
-                        for (int kx = 0; kx < kw; ++kx) {
-                            const int ix = xx * stride + kx - pad;
-                            if (ix < 0 || ix >= iw) continue;
-                            const size_t xi = ((size_t) c * ih + iy) * iw + ix;
-                            const size_t wi = (((size_t) o * ic + c) * kh + ky) * kw + kx;
-                            acc += x[xi] * w[wi];
-                        }
-                    }
-                }
-                y[((size_t) o * oh + yy) * ow + xx] = acc;
-            }
-        }
-    }
+static ggml_tensor * make_4d(ggml_context * ctx, const char * name, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
+    ggml_tensor * t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
+    ggml_set_name(t, name);
+    return t;
 }
 
-static void group_norm_relu(std::vector<float>& x, int c, int h, int w,
-                            const std::vector<float>& gamma,
-                            const std::vector<float>& beta,
-                            bool relu) {
-    const int groups = 32;
-    const int cpg = c / groups;
-    const int spatial = h * w;
-    for (int g = 0; g < groups; ++g) {
-        double mean = 0.0, var = 0.0;
-        const int begin = g * cpg;
-        const int n = cpg * spatial;
-        for (int cc = 0; cc < cpg; ++cc) {
-            const size_t base = (size_t) (begin + cc) * spatial;
-            for (int i = 0; i < spatial; ++i) mean += x[base + i];
-        }
-        mean /= n;
-        for (int cc = 0; cc < cpg; ++cc) {
-            const size_t base = (size_t) (begin + cc) * spatial;
-            for (int i = 0; i < spatial; ++i) {
-                const double d = (double) x[base + i] - mean;
-                var += d * d;
-            }
-        }
-        const float inv = 1.0f / std::sqrt((float) (var / n) + 1e-5f);
-        for (int cc = 0; cc < cpg; ++cc) {
-            const int ch = begin + cc;
-            const size_t base = (size_t) ch * spatial;
-            for (int i = 0; i < spatial; ++i) {
-                float v = ((x[base + i] - (float) mean) * inv) * gamma[ch] + beta[ch];
-                if (relu && v < 0.0f) v = 0.0f;
-                x[base + i] = v;
-            }
-        }
-    }
-}
-
-static bool run_one_obs_tokenizer(const OctoObsWeights& w,
-                                  const NpyU8& obs,
-                                  const NpyU8& task,
-                                  int side,
-                                  int n_tok,
-                                  std::vector<float>& tok,
-                                  std::vector<float>& proj,
-                                  std::vector<float>& pos) {
+static bool run_one_obs_tokenizer_graph(const OctoObsWeights& w,
+                                        const NpyU8& obs,
+                                        const NpyU8& task,
+                                        int side,
+                                        int n_tok,
+                                        std::vector<float>& tok,
+                                        std::vector<float>& proj,
+                                        std::vector<float>& pos) {
     if (obs.shape.size() != 5 || task.shape.size() != 4 ||
         obs.shape[0] != 1 || obs.shape[1] != 2 || obs.shape[2] != 3 ||
         task.shape[0] != 1 || task.shape[1] != 3 ||
@@ -440,56 +380,138 @@ static bool run_one_obs_tokenizer(const OctoObsWeights& w,
     tok.assign((size_t) 1 * 2 * n_tok * 512, 0.0f);
     proj.assign((size_t) 1 * 2 * n_tok * 384, 0.0f);
     pos.assign((size_t) 1 * 2 * n_tok * 384, 0.0f);
+
     const int stem_oc[4] = {32, 96, 192, 384};
     const int stem_ic[4] = {6, 32, 96, 192};
-    std::vector<float> x, y, ws;
+    std::vector<float> input((size_t) side * side * 6 * 2, 0.0f);
     for (int t = 0; t < 2; ++t) {
-        x.assign((size_t) 6 * side * side, 0.0f);
         for (int c = 0; c < 3; ++c) {
             for (int yy = 0; yy < side; ++yy) {
                 for (int xx = 0; xx < side; ++xx) {
                     const size_t oi = ((((size_t) t * 3 + c) * side + yy) * side + xx);
                     const size_t ti = (((size_t) c * side + yy) * side + xx);
-                    x[((size_t) c * side + yy) * side + xx] = (float) obs.data[oi] / 127.5f - 1.0f;
-                    x[((size_t) (c + 3) * side + yy) * side + xx] = (float) task.data[ti] / 127.5f - 1.0f;
+                    input[(((size_t) t * 6 + c) * side + yy) * side + xx] = (float) obs.data[oi] / 127.5f - 1.0f;
+                    input[(((size_t) t * 6 + c + 3) * side + yy) * side + xx] = (float) task.data[ti] / 127.5f - 1.0f;
                 }
-            }
-        }
-        int h = side, wid = side;
-        for (int li = 0; li < 4; ++li) {
-            standardize_conv_weight(w.conv_w[li], stem_oc[li], stem_ic[li], 3, 3, ws);
-            int oh = 0, ow = 0;
-            conv2d(x, stem_ic[li], h, wid, ws, w.conv_b[li], stem_oc[li], 3, 3, 2, 1, y, oh, ow);
-            group_norm_relu(y, stem_oc[li], oh, ow, w.gn_w[li], w.gn_b[li], true);
-            x.swap(y);
-            h = oh;
-            wid = ow;
-        }
-        int ph = 0, pw = 0;
-        conv2d(x, 384, h, wid, w.patch_w, w.patch_b, 512, 1, 1, 1, 0, y, ph, pw);
-        if (ph * pw != n_tok) {
-            std::fprintf(stderr, "vla(octo): patch token count %d, expected %d\n", ph * pw, n_tok);
-            return false;
-        }
-        for (int yy = 0; yy < ph; ++yy) {
-            for (int xx = 0; xx < pw; ++xx) {
-                const int k = yy * pw + xx;
-                for (int c = 0; c < 512; ++c) {
-                    tok[((size_t) t * n_tok + k) * 512 + c] = y[((size_t) c * ph + yy) * pw + xx];
-                }
-            }
-        }
-        for (int k = 0; k < n_tok; ++k) {
-            for (int o = 0; o < 384; ++o) {
-                float acc = w.proj_b[o];
-                for (int i = 0; i < 512; ++i) {
-                    acc += tok[((size_t) t * n_tok + k) * 512 + i] * w.proj_w[(size_t) o * 512 + i];
-                }
-                proj[((size_t) t * n_tok + k) * 384 + o] = acc;
-                pos[((size_t) t * n_tok + k) * 384 + o] = acc + w.pos[((size_t) t * n_tok + k) * 384 + o];
             }
         }
     }
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        std::fprintf(stderr, "vla(octo): ggml_backend_cpu_init failed for tokenizer graph\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, default_cpu_threads());
+
+    ggml_init_params gp = {(size_t) 96 * 1024 * 1024, nullptr, true};
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) {
+        std::fprintf(stderr, "vla(octo): ggml_init(tokenizer graph ctx) failed\n");
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    std::vector<ggml_tensor *> tensors;
+    std::vector<std::vector<float>> payloads;
+    auto add_payload = [&](ggml_tensor * t, std::vector<float> data) {
+        tensors.push_back(t);
+        payloads.push_back(std::move(data));
+    };
+    auto expand_1d = [](const std::vector<float>& src, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
+        std::vector<float> out((size_t) ne0 * ne1 * ne2 * ne3, 0.0f);
+        for (int64_t i3 = 0; i3 < ne3; ++i3)
+            for (int64_t i2 = 0; i2 < ne2; ++i2)
+                for (int64_t i1 = 0; i1 < ne1; ++i1)
+                    for (int64_t i0 = 0; i0 < ne0; ++i0)
+                        out[((size_t) i3 * ne2 * ne1 * ne0) + (size_t) i2 * ne1 * ne0 + (size_t) i1 * ne0 + i0] = src[(size_t) i2];
+        return out;
+    };
+
+    ggml_tensor * x = make_4d(ctx, "octo.obs.input_norm", side, side, 6, 2);
+    add_payload(x, std::move(input));
+
+    for (int li = 0; li < 4; ++li) {
+        std::vector<float> ws;
+        standardize_conv_weight(w.conv_w[li], stem_oc[li], stem_ic[li], 3, 3, ws);
+        char name[64];
+        std::snprintf(name, sizeof(name), "octo.obs.stem.%d.conv.weight_std", li);
+        ggml_tensor * cw = make_4d(ctx, name, 3, 3, stem_ic[li], stem_oc[li]);
+        add_payload(cw, std::move(ws));
+        std::snprintf(name, sizeof(name), "octo.obs.stem.%d.conv.bias", li);
+        ggml_tensor * cb = make_4d(ctx, name, 1, 1, stem_oc[li], 1);
+        add_payload(cb, expand_1d(w.conv_b[li], 1, 1, stem_oc[li], 1));
+        std::snprintf(name, sizeof(name), "octo.obs.stem.%d.gn.weight", li);
+        ggml_tensor * gw = make_4d(ctx, name, 1, 1, stem_oc[li], 1);
+        add_payload(gw, expand_1d(w.gn_w[li], 1, 1, stem_oc[li], 1));
+        std::snprintf(name, sizeof(name), "octo.obs.stem.%d.gn.bias", li);
+        ggml_tensor * gb = make_4d(ctx, name, 1, 1, stem_oc[li], 1);
+        add_payload(gb, expand_1d(w.gn_b[li], 1, 1, stem_oc[li], 1));
+
+        x = ggml_conv_2d(ctx, cw, x, 2, 2, 1, 1, 1, 1);
+        x = ggml_add(ctx, x, cb);
+        x = ggml_group_norm(ctx, x, 32, 1e-5f);
+        x = ggml_add(ctx, ggml_mul(ctx, x, gw), gb);
+        x = ggml_relu(ctx, x);
+    }
+
+    ggml_tensor * pw = make_4d(ctx, "octo.obs.patch_embd.weight", 1, 1, 384, 512);
+    add_payload(pw, w.patch_w);
+    ggml_tensor * pb = make_4d(ctx, "octo.obs.patch_embd.bias", 1, 1, 512, 1);
+    add_payload(pb, expand_1d(w.patch_b, 1, 1, 512, 1));
+    ggml_tensor * jw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, 384);
+    ggml_set_name(jw, "octo.obs.proj.weight");
+    add_payload(jw, w.proj_w);
+    ggml_tensor * jb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 384, 1, 1);
+    ggml_set_name(jb, "octo.obs.proj.bias");
+    add_payload(jb, w.proj_b);
+    std::vector<float> pos2(w.pos.begin(), w.pos.begin() + (size_t) 2 * n_tok * 384);
+    ggml_tensor * pe = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 384, n_tok, 2);
+    ggml_set_name(pe, "octo.obs.pos_embd.window2");
+    add_payload(pe, std::move(pos2));
+
+    ggml_tensor * patch = ggml_conv_2d(ctx, pw, x, 1, 1, 0, 0, 1, 1);
+    patch = ggml_add(ctx, patch, pb);
+    ggml_tensor * tok_t = ggml_cont(ctx, ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, patch, 1, 2, 0, 3)), 512, n_tok, 2));
+    ggml_set_name(tok_t, "obs.tokenizer.tok");
+    ggml_set_output(tok_t);
+
+    ggml_tensor * proj_t = ggml_add(ctx, ggml_mul_mat(ctx, jw, tok_t), jb);
+    ggml_set_name(proj_t, "obs.tokenizer.proj");
+    ggml_set_output(proj_t);
+    ggml_tensor * pos_t = ggml_add(ctx, proj_t, pe);
+    ggml_set_name(pos_t, "obs.tokenizer.pos");
+    ggml_set_output(pos_t);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
+    ggml_build_forward_expand(graph, pos_t);
+    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
+        std::fprintf(stderr, "vla(octo): tokenizer ggml_gallocr_alloc_graph failed\n");
+        if (gallocr) ggml_gallocr_free(gallocr);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        ggml_backend_tensor_set(tensors[i], payloads[i].data(), 0, ggml_nbytes(tensors[i]));
+    }
+    const ggml_status st = ggml_backend_graph_compute(backend, graph);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "vla(octo): tokenizer ggml_backend_graph_compute failed (%d)\n", (int) st);
+        ggml_gallocr_free(gallocr);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_get(tok_t, tok.data(), 0, ggml_nbytes(tok_t));
+    ggml_backend_tensor_get(proj_t, proj.data(), 0, ggml_nbytes(proj_t));
+    ggml_backend_tensor_get(pos_t, pos.data(), 0, ggml_nbytes(pos_t));
+
+    ggml_gallocr_free(gallocr);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
     return true;
 }
 
@@ -605,11 +627,11 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
     }
 
     std::vector<float> tok, proj, pos;
-    if (!run_one_obs_tokenizer(primary_w, primary_obs, primary_task, 256, 256, tok, proj, pos)) return false;
+    if (!run_one_obs_tokenizer_graph(primary_w, primary_obs, primary_task, 256, 256, tok, proj, pos)) return false;
     if (!write_f32_dump(dump_dir, "obs.primary.tok",  tok,  {1, 2, 256, 512}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.primary.proj", proj, {1, 2, 256, 384}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.primary.pos",  pos,  {1, 2, 256, 384}, mf)) return false;
-    if (!run_one_obs_tokenizer(wrist_w, wrist_obs, wrist_task, 128, 64, tok, proj, pos)) return false;
+    if (!run_one_obs_tokenizer_graph(wrist_w, wrist_obs, wrist_task, 128, 64, tok, proj, pos)) return false;
     if (!write_f32_dump(dump_dir, "obs.wrist.tok",  tok,  {1, 2, 64, 512}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.wrist.proj", proj, {1, 2, 64, 384}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.wrist.pos",  pos,  {1, 2, 64, 384}, mf)) return false;
