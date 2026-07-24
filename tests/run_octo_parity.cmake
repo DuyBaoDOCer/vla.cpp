@@ -5,8 +5,13 @@ endif()
 get_filename_component(DUMP_PARENT "${DUMP_DIR}" DIRECTORY)
 file(MAKE_DIRECTORY "${DUMP_PARENT}")
 
+set(T5_ARGS "")
+if(DEFINED T5_INJECT AND NOT "${T5_INJECT}" STREQUAL "")
+  list(APPEND T5_ARGS --t5-inject "${T5_INJECT}")
+endif()
+
 execute_process(
-  COMMAND "${DUMPER}" --ckpt "${CKPT}" --case "${CASE_DIR}" --out "${DUMP_DIR}"
+  COMMAND "${DUMPER}" --ckpt "${CKPT}" --case "${CASE_DIR}" ${T5_ARGS} --out "${DUMP_DIR}"
   RESULT_VARIABLE dump_rc
 )
 if(NOT dump_rc EQUAL 0)

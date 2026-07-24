@@ -20,6 +20,12 @@ BOUNDARY_MAP = {
     "obs.wrist.pos": "octo_transformer.obs_wrist.tokens_after_pos_embedding",
 }
 
+LANGUAGE_BOUNDARY_MAP = {
+    "lang.proj": "octo_transformer.task_language.tokens_after_projection",
+    "lang.pos": "octo_transformer.task_language.tokens_after_pos_embedding",
+    "repeated_language": "octo_transformer.obs_task_language.tokens_repeated_task",
+}
+
 
 def load_dump_manifest(path: Path) -> dict[str, tuple[Path, tuple[int, ...]]]:
     rows: dict[str, tuple[Path, tuple[int, ...]]] = {}
@@ -116,7 +122,11 @@ def main() -> int:
     rows = []
     ok = True
     print("boundary\tgolden\tshape\tmax_abs_err\tmax_rel_err\tcosine\tstatus\toracle_max_rel_err\toracle_status")
-    for dump_name, golden_name in BOUNDARY_MAP.items():
+    boundary_map = dict(BOUNDARY_MAP)
+    if any(name in dump for name in LANGUAGE_BOUNDARY_MAP):
+        boundary_map.update(LANGUAGE_BOUNDARY_MAP)
+
+    for dump_name, golden_name in boundary_map.items():
         if dump_name not in dump:
             raise SystemExit(f"missing dump boundary: {dump_name}")
         if golden_name not in tensors:

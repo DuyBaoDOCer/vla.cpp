@@ -12,6 +12,7 @@ int main(int argc, char ** argv) {
     std::string ckpt;
     std::string case_dir;
     std::string dump_dir;
+    std::string t5_inject_path;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char * opt) -> const char * {
@@ -33,6 +34,10 @@ int main(int argc, char ** argv) {
             const char * v = need("--out");
             if (!v) return 1;
             dump_dir = v;
+        } else if (a == "--t5-inject") {
+            const char * v = need("--t5-inject");
+            if (!v) return 1;
+            t5_inject_path = v;
         } else {
             std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
             return 1;
@@ -42,10 +47,10 @@ int main(int argc, char ** argv) {
         if (const char * env = std::getenv("VLA_OCTO_DUMP")) dump_dir = env;
     }
     if (ckpt.empty() || case_dir.empty() || dump_dir.empty()) {
-        std::fprintf(stderr, "usage: %s --ckpt octo-small-1.5-f32.gguf --case <golden-case-dir> [--out <dump-dir>|VLA_OCTO_DUMP=<dump-dir>]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s --ckpt octo-small-1.5-f32.gguf --case <golden-case-dir> [--t5-inject <npy>] [--out <dump-dir>|VLA_OCTO_DUMP=<dump-dir>]\n", argv[0]);
         return 1;
     }
-    if (!vla::octo_dump_tokenizer_case(ckpt, case_dir, dump_dir)) return 2;
+    if (!vla::octo_dump_tokenizer_case(ckpt, case_dir, dump_dir, t5_inject_path)) return 2;
     std::printf("octo_parity_dump wrote %s\n", dump_dir.c_str());
     return 0;
 }

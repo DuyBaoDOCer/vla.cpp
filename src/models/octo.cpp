@@ -217,6 +217,11 @@ struct NpyU8 {
     std::vector<uint8_t> data;
 };
 
+struct NpyF32 {
+    std::vector<int64_t> shape;
+    std::vector<float> data;
+};
+
 static bool read_file_all(const std::string& path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
@@ -286,6 +291,65 @@ static bool parse_npy_u8(const std::string& path, NpyU8& out) {
     return true;
 }
 
+static bool parse_npy_f32(const std::string& path, NpyF32& out) {
+    std::vector<uint8_t> bytes;
+    if (!read_file_all(path, bytes)) return false;
+    if (bytes.size() < 16 || std::memcmp(bytes.data(), "\x93NUMPY", 6) != 0) {
+        std::fprintf(stderr, "vla(octo): %s is not a .npy file\n", path.c_str());
+        return false;
+    }
+    const int major = bytes[6];
+    size_t pos = 8;
+    uint32_t hlen = 0;
+    if (major == 1) {
+        hlen = (uint32_t) bytes[pos] | ((uint32_t) bytes[pos + 1] << 8);
+        pos += 2;
+    } else if (major == 2 || major == 3) {
+        hlen = (uint32_t) bytes[pos] | ((uint32_t) bytes[pos + 1] << 8) |
+               ((uint32_t) bytes[pos + 2] << 16) | ((uint32_t) bytes[pos + 3] << 24);
+        pos += 4;
+    } else {
+        std::fprintf(stderr, "vla(octo): unsupported .npy version %d in %s\n", major, path.c_str());
+        return false;
+    }
+    if (pos + hlen > bytes.size()) return false;
+    const std::string header(reinterpret_cast<const char *>(bytes.data() + pos), hlen);
+    pos += hlen;
+    if (header.find("'descr': '<f4'") == std::string::npos &&
+        header.find("\"descr\": \"<f4\"") == std::string::npos &&
+        header.find("'descr': '|f4'") == std::string::npos &&
+        header.find("\"descr\": \"|f4\"") == std::string::npos) {
+        std::fprintf(stderr, "vla(octo): %s expected float32 .npy\n", path.c_str());
+        return false;
+    }
+    if (header.find("'fortran_order': False") == std::string::npos &&
+        header.find("\"fortran_order\": False") == std::string::npos) {
+        std::fprintf(stderr, "vla(octo): %s expected C-order .npy\n", path.c_str());
+        return false;
+    }
+    const size_t l = header.find('(');
+    const size_t r = header.find(')', l == std::string::npos ? 0 : l);
+    if (l == std::string::npos || r == std::string::npos) return false;
+    out.shape.clear();
+    size_t s = l + 1;
+    while (s < r) {
+        while (s < r && (header[s] == ' ' || header[s] == ',')) ++s;
+        size_t e = s;
+        while (e < r && header[e] >= '0' && header[e] <= '9') ++e;
+        if (e > s) out.shape.push_back(std::strtoll(header.substr(s, e - s).c_str(), nullptr, 10));
+        s = e + 1;
+    }
+    int64_t ne = 1;
+    for (int64_t d : out.shape) ne *= d;
+    if (pos + (size_t) ne * sizeof(float) > bytes.size()) {
+        std::fprintf(stderr, "vla(octo): %s truncated .npy payload\n", path.c_str());
+        return false;
+    }
+    out.data.resize((size_t) ne);
+    std::memcpy(out.data.data(), bytes.data() + pos, (size_t) ne * sizeof(float));
+    return true;
+}
+
 static bool write_f32_dump(const std::string& dir,
                            const char * name,
                            const std::vector<float>& data,
@@ -319,6 +383,10 @@ struct OctoObsWeights {
     std::vector<float> patch_w, patch_b, proj_w, proj_b, pos;
 };
 
+struct OctoLanguageWeights {
+    std::vector<float> proj_w, proj_b, pos;
+};
+
 static bool read_obs_weights(gguf_reader& g, const char * view, OctoObsWeights& w) {
     char name[160];
     for (int i = 0; i < 4; ++i) {
@@ -334,6 +402,13 @@ static bool read_obs_weights(gguf_reader& g, const char * view, OctoObsWeights& 
     std::snprintf(name, sizeof(name), "octo.obs.%s.proj.bias",         view); w.proj_b  = g.read_f32(name);
     std::snprintf(name, sizeof(name), "octo.obs.%s.pos_embd",          view); w.pos     = g.read_f32(name);
     return !w.patch_w.empty() && !w.patch_b.empty() && !w.proj_w.empty() && !w.proj_b.empty() && !w.pos.empty();
+}
+
+static bool read_language_weights(gguf_reader& g, OctoLanguageWeights& w) {
+    w.proj_w = g.read_f32("octo.task.language.proj.weight");
+    w.proj_b = g.read_f32("octo.task.language.proj.bias");
+    w.pos    = g.read_f32("octo.task.language.pos_embd");
+    return !w.proj_w.empty() && !w.proj_b.empty() && !w.pos.empty();
 }
 
 static void standardize_conv_weight(const std::vector<float>& src,
@@ -515,6 +590,96 @@ static bool run_one_obs_tokenizer_graph(const OctoObsWeights& w,
     return true;
 }
 
+static bool run_language_graph(const OctoLanguageWeights& w,
+                               const NpyF32& t5,
+                               std::vector<float>& proj,
+                               std::vector<float>& pos,
+                               std::vector<float>& repeated) {
+    if (t5.shape.size() != 3 || t5.shape[0] != 1 || t5.shape[1] != 16 || t5.shape[2] != 768) {
+        std::fprintf(stderr, "vla(octo): expected T5 inject shape [1,16,768]\n");
+        return false;
+    }
+    proj.assign((size_t) 1 * 16 * 384, 0.0f);
+    pos.assign((size_t) 1 * 16 * 384, 0.0f);
+    repeated.assign((size_t) 1 * 2 * 16 * 384, 0.0f);
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        std::fprintf(stderr, "vla(octo): ggml_backend_cpu_init failed for language graph\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, default_cpu_threads());
+
+    ggml_init_params gp = {(size_t) 8 * 1024 * 1024, nullptr, true};
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) {
+        std::fprintf(stderr, "vla(octo): ggml_init(language graph ctx) failed\n");
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    std::vector<ggml_tensor *> tensors;
+    std::vector<std::vector<float>> payloads;
+    auto add_payload = [&](ggml_tensor * t, std::vector<float> data) {
+        tensors.push_back(t);
+        payloads.push_back(std::move(data));
+    };
+
+    ggml_tensor * inp = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 768, 16, 1);
+    ggml_set_name(inp, "octo.task.language.t5_inject");
+    add_payload(inp, t5.data);
+    ggml_tensor * jw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 768, 384);
+    ggml_set_name(jw, "octo.task.language.proj.weight");
+    add_payload(jw, w.proj_w);
+    ggml_tensor * jb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 384, 1, 1);
+    ggml_set_name(jb, "octo.task.language.proj.bias");
+    add_payload(jb, w.proj_b);
+    ggml_tensor * pe = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 384, 16, 1);
+    ggml_set_name(pe, "octo.task.language.pos_embd");
+    add_payload(pe, w.pos);
+
+    ggml_tensor * proj_t = ggml_add(ctx, ggml_mul_mat(ctx, jw, inp), jb);
+    ggml_set_name(proj_t, "task_language.proj");
+    ggml_set_output(proj_t);
+    ggml_tensor * pos_t = ggml_add(ctx, proj_t, pe);
+    ggml_set_name(pos_t, "task_language.pos");
+    ggml_set_output(pos_t);
+    ggml_tensor * repeated_t = ggml_repeat_4d(ctx, pos_t, 384, 16, 2, 1);
+    ggml_set_name(repeated_t, "obs_task_language.repeated");
+    ggml_set_output(repeated_t);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 1024, false);
+    ggml_build_forward_expand(graph, repeated_t);
+    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
+        std::fprintf(stderr, "vla(octo): language ggml_gallocr_alloc_graph failed\n");
+        if (gallocr) ggml_gallocr_free(gallocr);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        ggml_backend_tensor_set(tensors[i], payloads[i].data(), 0, ggml_nbytes(tensors[i]));
+    }
+    const ggml_status st = ggml_backend_graph_compute(backend, graph);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "vla(octo): language ggml_backend_graph_compute failed (%d)\n", (int) st);
+        ggml_gallocr_free(gallocr);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_get(proj_t, proj.data(), 0, ggml_nbytes(proj_t));
+    ggml_backend_tensor_get(pos_t, pos.data(), 0, ggml_nbytes(pos_t));
+    ggml_backend_tensor_get(repeated_t, repeated.data(), 0, ggml_nbytes(repeated_t));
+
+    ggml_gallocr_free(gallocr);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
 }  // namespace
 
 std::unique_ptr<ModelArchBase> octo_create(const std::string& mmproj_path,
@@ -597,7 +762,8 @@ bool octo_dump_gguf_inventory(const std::string& ckpt_path) {
 
 bool octo_dump_tokenizer_case(const std::string& ckpt_path,
                               const std::string& case_dir,
-                              const std::string& dump_dir) {
+                              const std::string& dump_dir,
+                              const std::string& t5_inject_path) {
     gguf_reader g{"octo"};
     if (!g.open(ckpt_path)) return false;
 
@@ -635,6 +801,17 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
     if (!write_f32_dump(dump_dir, "obs.wrist.tok",  tok,  {1, 2, 64, 512}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.wrist.proj", proj, {1, 2, 64, 384}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.wrist.pos",  pos,  {1, 2, 64, 384}, mf)) return false;
+    if (!t5_inject_path.empty()) {
+        NpyF32 t5;
+        if (!parse_npy_f32(t5_inject_path, t5)) return false;
+        OctoLanguageWeights lang_w;
+        if (!read_language_weights(g, lang_w)) return false;
+        std::vector<float> lang_proj, lang_pos, repeated;
+        if (!run_language_graph(lang_w, t5, lang_proj, lang_pos, repeated)) return false;
+        if (!write_f32_dump(dump_dir, "lang.proj",         lang_proj, {1, 16, 384}, mf)) return false;
+        if (!write_f32_dump(dump_dir, "lang.pos",          lang_pos,  {1, 16, 384}, mf)) return false;
+        if (!write_f32_dump(dump_dir, "repeated_language", repeated,  {1, 2, 16, 384}, mf)) return false;
+    }
     return true;
 }
 
