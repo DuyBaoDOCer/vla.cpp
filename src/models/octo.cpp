@@ -230,6 +230,11 @@ struct NpyBool {
     std::vector<uint8_t> data;
 };
 
+struct NpyI32 {
+    std::vector<int64_t> shape;
+    std::vector<int32_t> data;
+};
+
 static bool read_file_all(const std::string& path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
@@ -414,6 +419,65 @@ static bool parse_npy_bool(const std::string& path, NpyBool& out) {
     return true;
 }
 
+static bool parse_npy_i32(const std::string& path, NpyI32& out) {
+    std::vector<uint8_t> bytes;
+    if (!read_file_all(path, bytes)) return false;
+    if (bytes.size() < 16 || std::memcmp(bytes.data(), "\x93NUMPY", 6) != 0) {
+        std::fprintf(stderr, "vla(octo): %s is not a .npy file\n", path.c_str());
+        return false;
+    }
+    const int major = bytes[6];
+    size_t pos = 8;
+    uint32_t hlen = 0;
+    if (major == 1) {
+        hlen = (uint32_t) bytes[pos] | ((uint32_t) bytes[pos + 1] << 8);
+        pos += 2;
+    } else if (major == 2 || major == 3) {
+        hlen = (uint32_t) bytes[pos] | ((uint32_t) bytes[pos + 1] << 8) |
+               ((uint32_t) bytes[pos + 2] << 16) | ((uint32_t) bytes[pos + 3] << 24);
+        pos += 4;
+    } else {
+        std::fprintf(stderr, "vla(octo): unsupported .npy version %d in %s\n", major, path.c_str());
+        return false;
+    }
+    if (pos + hlen > bytes.size()) return false;
+    const std::string header(reinterpret_cast<const char *>(bytes.data() + pos), hlen);
+    pos += hlen;
+    if (header.find("'descr': '<i4'") == std::string::npos &&
+        header.find("\"descr\": \"<i4\"") == std::string::npos &&
+        header.find("'descr': '=i4'") == std::string::npos &&
+        header.find("\"descr\": \"=i4\"") == std::string::npos) {
+        std::fprintf(stderr, "vla(octo): %s expected int32 .npy\n", path.c_str());
+        return false;
+    }
+    if (header.find("'fortran_order': False") == std::string::npos &&
+        header.find("\"fortran_order\": False") == std::string::npos) {
+        std::fprintf(stderr, "vla(octo): %s expected C-order .npy\n", path.c_str());
+        return false;
+    }
+    const size_t l = header.find('(');
+    const size_t r = header.find(')', l == std::string::npos ? 0 : l);
+    if (l == std::string::npos || r == std::string::npos) return false;
+    out.shape.clear();
+    size_t s = l + 1;
+    while (s < r) {
+        while (s < r && (header[s] == ' ' || header[s] == ',')) ++s;
+        size_t e = s;
+        while (e < r && header[e] >= '0' && header[e] <= '9') ++e;
+        if (e > s) out.shape.push_back(std::strtoll(header.substr(s, e - s).c_str(), nullptr, 10));
+        s = e + 1;
+    }
+    int64_t ne = 1;
+    for (int64_t d : out.shape) ne *= d;
+    if (pos + (size_t) ne * sizeof(int32_t) > bytes.size()) {
+        std::fprintf(stderr, "vla(octo): %s truncated .npy payload\n", path.c_str());
+        return false;
+    }
+    out.data.resize((size_t) ne);
+    std::memcpy(out.data.data(), bytes.data() + pos, (size_t) ne * sizeof(int32_t));
+    return true;
+}
+
 static bool write_f32_dump(const std::string& dir,
                            const char * name,
                            const std::vector<float>& data,
@@ -481,6 +545,19 @@ struct OctoTransformerWeights {
     std::vector<float> output_norm_w, output_norm_b, readout_pos;
 };
 
+struct OctoT5BlockWeights {
+    std::vector<float> attn_norm_w;
+    std::vector<float> q_w, k_w, v_w, o_w;
+    std::vector<float> ffn_norm_w;
+    std::vector<float> ffn_up_w, ffn_down_w;
+};
+
+struct OctoT5Weights {
+    std::array<OctoT5BlockWeights, 12> blocks;
+    std::vector<float> attn_rel_b;    // shared bucket->head bias table, block 0 only
+    std::vector<float> output_norm_w;
+};
+
 struct OctoDiffusionBlockWeights {
     std::vector<float> ln_w, ln_b;
     std::vector<float> fc1_w, fc1_b;
@@ -540,6 +617,32 @@ static bool read_transformer_weights(gguf_reader& g, OctoTransformerWeights& w) 
     w.output_norm_b = g.read_f32("octo.output_norm.bias");
     w.readout_pos   = g.read_f32("octo.readout.action.pos_embd");
     return !w.output_norm_w.empty() && !w.output_norm_b.empty() && w.readout_pos.size() >= 2 * 384;
+}
+
+static bool read_t5_weights(gguf_reader& g, OctoT5Weights& w) {
+    char name[160];
+    for (int i = 0; i < 12; ++i) {
+        OctoT5BlockWeights& b = w.blocks[(size_t) i];
+        auto read = [&](const char * leaf, std::vector<float>& dst) {
+            std::snprintf(name, sizeof(name), "octo.t5.blk.%d.%s", i, leaf);
+            dst = g.read_f32(name);
+            return !dst.empty();
+        };
+        if (!read("attn_norm.weight", b.attn_norm_w) ||
+            !read("attn_q.weight", b.q_w) || !read("attn_k.weight", b.k_w) ||
+            !read("attn_v.weight", b.v_w) || !read("attn_o.weight", b.o_w) ||
+            !read("ffn_norm.weight", b.ffn_norm_w) ||
+            !read("ffn_up.weight", b.ffn_up_w) || !read("ffn_down.weight", b.ffn_down_w)) return false;
+        if (b.attn_norm_w.size() != 768 || b.q_w.size() != 768 * 768 || b.k_w.size() != 768 * 768 ||
+            b.v_w.size() != 768 * 768 || b.o_w.size() != 768 * 768 || b.ffn_norm_w.size() != 768 ||
+            b.ffn_up_w.size() != 768 * 3072 || b.ffn_down_w.size() != 3072 * 768) {
+            std::fprintf(stderr, "vla(octo): T5 block %d weight has unexpected size\n", i);
+            return false;
+        }
+    }
+    w.attn_rel_b = g.read_f32("octo.t5.blk.0.attn_rel_b.weight");
+    w.output_norm_w = g.read_f32("octo.t5.output_norm.weight");
+    return w.attn_rel_b.size() == 12 * 32 && w.output_norm_w.size() == 768;
 }
 
 static bool read_diffusion_weights(gguf_reader& g, OctoDiffusionWeights& w) {
@@ -832,6 +935,191 @@ static bool run_language_graph(const OctoLanguageWeights& w,
     ggml_backend_tensor_get(proj_t, proj.data(), 0, ggml_nbytes(proj_t));
     ggml_backend_tensor_get(pos_t, pos.data(), 0, ggml_nbytes(pos_t));
     ggml_backend_tensor_get(repeated_t, repeated.data(), 0, ggml_nbytes(repeated_t));
+
+    ggml_gallocr_free(gallocr);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
+// T5 relative-position bucket, encoder self-attention (bidirectional=true).
+// Matches HF T5Attention._relative_position_bucket / llama.cpp's llama_relative_position_bucket:
+// relative_position = key_pos - query_pos, 32 buckets, max_distance 128.
+static int32_t t5_relative_position_bucket(int32_t query_pos, int32_t key_pos, int32_t n_buckets, int32_t max_distance) {
+    const int32_t nb = n_buckets / 2;
+    const int32_t relative_position = key_pos - query_pos;
+    int32_t bucket = (relative_position > 0) ? nb : 0;
+    const int32_t rp = std::abs(relative_position);
+    const int32_t max_exact = nb / 2;
+    if (rp < max_exact) {
+        bucket += rp;
+    } else {
+        const float v = (float) max_exact + std::log((float) rp / (float) max_exact) /
+                         std::log((float) max_distance / (float) max_exact) * (float) (nb - max_exact);
+        int32_t rp_large = (int32_t) std::floor(v);
+        rp_large = std::min(rp_large, nb - 1);
+        bucket += rp_large;
+    }
+    return bucket;
+}
+
+// T5-base encoder-only forward as a ggml graph: embedding lookup (host-side row fetch) -> 12x
+// [T5LayerNorm(RMS) -> self-attn (shared relative-position bias + padding mask, no query scaling)
+// -> residual -> T5LayerNorm -> DenseReluDense(ReLU) -> residual] -> final T5LayerNorm.
+static bool run_t5_encoder_graph(gguf_reader& g,
+                                 OctoT5Weights& w,
+                                 const std::vector<int32_t>& input_ids,
+                                 const std::vector<int32_t>& attention_mask,
+                                 std::vector<float>& t5_out) {
+    constexpr int hidden = 768;
+    constexpr int heads = 12;
+    constexpr int head_dim = 64;
+    constexpr int ffn = 3072;
+    constexpr int seq = 16;
+    constexpr int n_buckets = 32;
+    constexpr int max_distance = 128;
+    constexpr float ln_eps = 1e-6f;
+    if (input_ids.size() != seq || attention_mask.size() != seq) {
+        std::fprintf(stderr, "vla(octo): T5 encoder expected %d input_ids/attention_mask\n", seq);
+        return false;
+    }
+
+    std::vector<float> embed((size_t) hidden * seq);
+    if (!g.fetch_rows_f32("octo.t5.tok_embd.weight", input_ids, embed.data(), hidden)) return false;
+
+    std::vector<int32_t> bucket_idx((size_t) seq * seq);
+    std::vector<float> padmask((size_t) seq * seq);
+    for (int j = 0; j < seq; ++j) {          // query
+        for (int i = 0; i < seq; ++i) {      // key
+            bucket_idx[(size_t) j * seq + i] = t5_relative_position_bucket(j, i, n_buckets, max_distance);
+            padmask[(size_t) j * seq + i] = attention_mask[(size_t) i] != 0 ? 0.0f : -FLT_MAX;
+        }
+    }
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        std::fprintf(stderr, "vla(octo): ggml_backend_cpu_init failed for T5 encoder graph\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, default_cpu_threads());
+    ggml_init_params gp = {(size_t) 32 * 1024 * 1024, nullptr, true};
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    std::vector<ggml_tensor *> tensors;
+    std::vector<std::vector<float>> payloads_f32;
+    std::vector<std::vector<int32_t>> payloads_i32;
+    auto add_f32 = [&](ggml_tensor * t, std::vector<float> data) {
+        tensors.push_back(t);
+        payloads_f32.push_back(std::move(data));
+        return t;
+    };
+    auto add_i32 = [&](ggml_tensor * t, std::vector<int32_t> data) {
+        tensors.push_back(t);
+        payloads_i32.push_back(std::move(data));
+        return t;
+    };
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, seq);
+    ggml_set_name(x, "octo.t5.input_embed");
+    add_f32(x, embed);
+
+    ggml_tensor * bucket = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, seq, seq);
+    ggml_set_name(bucket, "octo.t5.pos_bucket");
+    add_i32(bucket, bucket_idx);
+    ggml_tensor * rel_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, heads, n_buckets);
+    ggml_set_name(rel_b, "octo.t5.attn_rel_b");
+    add_f32(rel_b, std::move(w.attn_rel_b));
+    ggml_tensor * padmask_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq, seq);
+    ggml_set_name(padmask_t, "octo.t5.padmask");
+    add_f32(padmask_t, padmask);
+
+    ggml_tensor * pos_bucket_1d = ggml_reshape_1d(ctx, bucket, (int64_t) seq * seq);
+    ggml_tensor * pos_bias = ggml_get_rows(ctx, rel_b, pos_bucket_1d);
+    pos_bias = ggml_reshape_3d(ctx, pos_bias, heads, seq, seq);
+    pos_bias = ggml_cont(ctx, ggml_permute(ctx, pos_bias, 2, 0, 1, 3));
+    ggml_tensor * mask = ggml_add(ctx, pos_bias, padmask_t);
+
+    char name[160];
+    for (int i = 0; i < 12; ++i) {
+        OctoT5BlockWeights& b = w.blocks[(size_t) i];
+        auto n1w = add_f32(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden), std::move(b.attn_norm_w));
+        ggml_set_name(n1w, (std::snprintf(name, sizeof(name), "octo.t5.blk.%d.attn_norm.weight", i), name));
+        auto Wq = add_f32(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, hidden), std::move(b.q_w));
+        ggml_set_name(Wq, (std::snprintf(name, sizeof(name), "octo.t5.blk.%d.attn_q.weight", i), name));
+        auto Wk = add_f32(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, hidden), std::move(b.k_w));
+        ggml_set_name(Wk, (std::snprintf(name, sizeof(name), "octo.t5.blk.%d.attn_k.weight", i), name));
+        auto Wv = add_f32(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, hidden), std::move(b.v_w));
+        ggml_set_name(Wv, (std::snprintf(name, sizeof(name), "octo.t5.blk.%d.attn_v.weight", i), name));
+        auto Wo = add_f32(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, hidden), std::move(b.o_w));
+        ggml_set_name(Wo, (std::snprintf(name, sizeof(name), "octo.t5.blk.%d.attn_o.weight", i), name));
+        auto n2w = add_f32(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden), std::move(b.ffn_norm_w));
+        ggml_set_name(n2w, (std::snprintf(name, sizeof(name), "octo.t5.blk.%d.ffn_norm.weight", i), name));
+        auto Wup = add_f32(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, ffn), std::move(b.ffn_up_w));
+        ggml_set_name(Wup, (std::snprintf(name, sizeof(name), "octo.t5.blk.%d.ffn_up.weight", i), name));
+        auto Wdown = add_f32(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ffn, hidden), std::move(b.ffn_down_w));
+        ggml_set_name(Wdown, (std::snprintf(name, sizeof(name), "octo.t5.blk.%d.ffn_down.weight", i), name));
+
+        ggml_tensor * n1 = ggml_mul(ctx, ggml_rms_norm(ctx, x, ln_eps), n1w);
+        ggml_tensor * Q = ggml_mul_mat(ctx, Wq, n1);
+        ggml_tensor * K = ggml_mul_mat(ctx, Wk, n1);
+        ggml_tensor * V = ggml_mul_mat(ctx, Wv, n1);
+        ggml_tensor * Qh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, Q, head_dim, heads, seq), 0, 2, 1, 3));
+        ggml_tensor * Kh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, K, head_dim, heads, seq), 0, 2, 1, 3));
+        ggml_tensor * Vh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, V, head_dim, heads, seq), 1, 2, 0, 3));
+        ggml_tensor * scores = ggml_mul_mat(ctx, Kh, Qh);
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        ggml_tensor * probs = ggml_soft_max_ext(ctx, scores, mask, 1.0f, 0.0f);  // T5: no 1/sqrt(d_k) scaling
+        ggml_tensor * attended = ggml_mul_mat(ctx, Vh, probs);
+        ggml_tensor * merged = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, attended, 0, 2, 1, 3)), hidden, seq);
+        ggml_tensor * attn_out = ggml_mul_mat(ctx, Wo, merged);
+        x = ggml_add(ctx, x, attn_out);
+
+        ggml_tensor * n2 = ggml_mul(ctx, ggml_rms_norm(ctx, x, ln_eps), n2w);
+        ggml_tensor * h = ggml_relu(ctx, ggml_mul_mat(ctx, Wup, n2));
+        ggml_tensor * ffn_out = ggml_mul_mat(ctx, Wdown, h);
+        x = ggml_add(ctx, x, ffn_out);
+    }
+
+    ggml_tensor * outw = add_f32(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden), std::move(w.output_norm_w));
+    ggml_set_name(outw, "octo.t5.output_norm.weight");
+    ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, x, ln_eps), outw);
+    ggml_set_name(out, "t5.out");
+    ggml_set_output(out);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4096, false);
+    ggml_build_forward_expand(graph, out);
+    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
+        std::fprintf(stderr, "vla(octo): T5 encoder ggml_gallocr_alloc_graph failed\n");
+        if (gallocr) ggml_gallocr_free(gallocr);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    size_t fi = 0, ii = 0;
+    for (ggml_tensor * t : tensors) {
+        if (t->type == GGML_TYPE_I32) {
+            ggml_backend_tensor_set(t, payloads_i32[ii].data(), 0, ggml_nbytes(t));
+            ++ii;
+        } else {
+            ggml_backend_tensor_set(t, payloads_f32[fi].data(), 0, ggml_nbytes(t));
+            ++fi;
+        }
+    }
+    const ggml_status st = ggml_backend_graph_compute(backend, graph);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "vla(octo): T5 encoder ggml_backend_graph_compute failed (%d)\n", (int) st);
+        ggml_gallocr_free(gallocr);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    t5_out.resize((size_t) hidden * seq);
+    ggml_backend_tensor_get(out, t5_out.data(), 0, ggml_nbytes(out));
 
     ggml_gallocr_free(gallocr);
     ggml_free(ctx);
@@ -1474,72 +1762,91 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
     if (!write_f32_dump(dump_dir, "obs.wrist.proj", proj, {1, 2, 64, 384}, mf)) return false;
     if (!write_f32_dump(dump_dir, "obs.wrist.pos",  pos,  {1, 2, 64, 384}, mf)) return false;
     wrist_pos = pos;
-    if (!t5_inject_path.empty()) {
-        NpyF32 t5;
-        if (!parse_npy_f32(t5_inject_path, t5)) return false;
-        OctoLanguageWeights lang_w;
-        if (!read_language_weights(g, lang_w)) return false;
-        std::vector<float> lang_proj, lang_pos, repeated;
-        if (!run_language_graph(lang_w, t5, lang_proj, lang_pos, repeated)) return false;
-        if (!write_f32_dump(dump_dir, "lang.proj",         lang_proj, {1, 16, 384}, mf)) return false;
-        if (!write_f32_dump(dump_dir, "lang.pos",          lang_pos,  {1, 16, 384}, mf)) return false;
-        if (!write_f32_dump(dump_dir, "repeated_language", repeated,  {1, 2, 16, 384}, mf)) return false;
-
-        OctoTransformerWeights transformer_w;
-        if (!read_transformer_weights(g, transformer_w)) return false;
-        NpyBool task_valid, primary_valid, wrist_valid, timestep_valid;
-        if (!parse_npy_bool(case_dir + "/tensors/input.task.pad_mask_dict.language_instruction.npy", task_valid) ||
-            !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_primary.npy", primary_valid) ||
-            !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_wrist.npy", wrist_valid) ||
-            !parse_npy_bool(case_dir + "/tensors/input.observation.timestep_pad_mask.npy", timestep_valid)) return false;
-
-        OctoTransformerResult bt;
-        if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, bt.input)) return false;
-        std::vector<float> blocked_mask;
-        if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, bt.blocked_mask, blocked_mask)) return false;
-        if (!write_f32_dump(dump_dir, "bt.input", bt.input, {1, 690, 384}, mf)) return false;
-        if (!write_bool_dump(dump_dir, "bt.mask", bt.blocked_mask, {6, 690, 690}, mf)) return false;
-        if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, bt)) return false;
-        for (int i = 0; i < 12; ++i) {
-            char boundary[32];
-            std::snprintf(boundary, sizeof(boundary), "bt.blk%d.out", i);
-            if (!write_f32_dump(dump_dir, boundary, bt.block_outputs[(size_t) i], {1, 690, 384}, mf)) return false;
-        }
-        if (!write_f32_dump(dump_dir, "bt.output", bt.output, {1, 690, 384}, mf)) return false;
-        if (!write_f32_dump(dump_dir, "bt.task_language", bt.task_language, {1, 16, 384}, mf)) return false;
-        if (!write_f32_dump(dump_dir, "bt.obs_primary", bt.obs_primary, {1, 2, 256, 384}, mf)) return false;
-        if (!write_f32_dump(dump_dir, "bt.obs_wrist", bt.obs_wrist, {1, 2, 64, 384}, mf)) return false;
-        if (!write_f32_dump(dump_dir, "bt.obs_task_language", bt.obs_task_language, {1, 2, 16, 384}, mf)) return false;
-        if (!write_f32_dump(dump_dir, "bt.readout_action", bt.readout_action, {1, 2, 1, 384}, mf)) return false;
-
-        OctoDiffusionWeights diffusion_w;
-        if (!read_diffusion_weights(g, diffusion_w)) return false;
-        OctoDiffusionResult diff;
-        if (!run_diffusion_replay(diffusion_w, case_dir, bt.readout_action, diff)) return false;
-        if (!write_f32_dump(dump_dir, "diff.initial_noise", diff.initial_noise, {1, 2, 28}, mf)) return false;
-        if (!write_bool_dump(dump_dir, "diff.action_mask", diff.action_mask, {1, 2, 4, 7}, mf)) return false;
-        if (!write_bool_dump(dump_dir, "diff.flat_action_mask", diff.flat_action_mask, {1, 2, 28}, mf)) return false;
-        for (int step = 0; step < 20; ++step) {
-            char boundary[64];
-            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.current_x_before", step);
-            if (!write_f32_dump(dump_dir, boundary, diff.current_x_before[(size_t) step], {1, 2, 28}, mf)) return false;
-            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.pred_eps", step);
-            if (!write_f32_dump(dump_dir, boundary, diff.pred_eps[(size_t) step], {1, 2, 28}, mf)) return false;
-            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.z", step);
-            if (!write_f32_dump(dump_dir, boundary, diff.z[(size_t) step], {1, 2, 28}, mf)) return false;
-            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_denoise", step);
-            if (!write_f32_dump(dump_dir, boundary, diff.after_denoise[(size_t) step], {1, 2, 28}, mf)) return false;
-            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_noise_add", step);
-            if (!write_f32_dump(dump_dir, boundary, diff.after_noise_add[(size_t) step], {1, 2, 28}, mf)) return false;
-            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_clip", step);
-            if (!write_f32_dump(dump_dir, boundary, diff.after_clip[(size_t) step], {1, 2, 28}, mf)) return false;
-            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_mask", step);
-            if (!write_f32_dump(dump_dir, boundary, diff.after_mask[(size_t) step], {1, 2, 28}, mf)) return false;
-        }
-        if (!write_f32_dump(dump_dir, "diff.actions_all_timesteps", diff.actions_all_timesteps, {1, 2, 4, 7}, mf)) return false;
-        if (!write_f32_dump(dump_dir, "sample_actions.final_action_normalized", diff.final_actions, {1, 4, 7}, mf)) return false;
-        if (!write_f32_dump(dump_dir, "action_final", diff.final_actions, {1, 4, 7}, mf)) return false;
+    // T5-base encoder: always computed natively (M5). --t5-inject, when given, overrides the
+    // tokens fed downstream (oracle/fallback path); the native "t5.out" boundary is always
+    // dumped so it can be checked against golden regardless.
+    OctoT5Weights t5_w;
+    if (!read_t5_weights(g, t5_w)) return false;
+    NpyI32 input_ids, attn_mask;
+    if (!parse_npy_i32(case_dir + "/tensors/input.task.language_instruction.input_ids.npy", input_ids)) return false;
+    if (!parse_npy_i32(case_dir + "/tensors/input.task.language_instruction.attention_mask.npy", attn_mask)) return false;
+    if (input_ids.shape != std::vector<int64_t>({1, 16}) || attn_mask.shape != std::vector<int64_t>({1, 16})) {
+        std::fprintf(stderr, "vla(octo): unexpected input_ids/attention_mask shape\n");
+        return false;
     }
+    std::vector<float> t5_native_out;
+    if (!run_t5_encoder_graph(g, t5_w, input_ids.data, attn_mask.data, t5_native_out)) return false;
+    if (!write_f32_dump(dump_dir, "t5.out", t5_native_out, {1, 16, 768}, mf)) return false;
+
+    NpyF32 t5;
+    if (!t5_inject_path.empty()) {
+        if (!parse_npy_f32(t5_inject_path, t5)) return false;
+    } else {
+        t5.shape = {1, 16, 768};
+        t5.data = t5_native_out;
+    }
+    OctoLanguageWeights lang_w;
+    if (!read_language_weights(g, lang_w)) return false;
+    std::vector<float> lang_proj, lang_pos, repeated;
+    if (!run_language_graph(lang_w, t5, lang_proj, lang_pos, repeated)) return false;
+    if (!write_f32_dump(dump_dir, "lang.proj",         lang_proj, {1, 16, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "lang.pos",          lang_pos,  {1, 16, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "repeated_language", repeated,  {1, 2, 16, 384}, mf)) return false;
+
+    OctoTransformerWeights transformer_w;
+    if (!read_transformer_weights(g, transformer_w)) return false;
+    NpyBool task_valid, primary_valid, wrist_valid, timestep_valid;
+    if (!parse_npy_bool(case_dir + "/tensors/input.task.pad_mask_dict.language_instruction.npy", task_valid) ||
+        !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_primary.npy", primary_valid) ||
+        !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_wrist.npy", wrist_valid) ||
+        !parse_npy_bool(case_dir + "/tensors/input.observation.timestep_pad_mask.npy", timestep_valid)) return false;
+
+    OctoTransformerResult bt;
+    if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, bt.input)) return false;
+    std::vector<float> blocked_mask;
+    if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, bt.blocked_mask, blocked_mask)) return false;
+    if (!write_f32_dump(dump_dir, "bt.input", bt.input, {1, 690, 384}, mf)) return false;
+    if (!write_bool_dump(dump_dir, "bt.mask", bt.blocked_mask, {6, 690, 690}, mf)) return false;
+    if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, bt)) return false;
+    for (int i = 0; i < 12; ++i) {
+        char boundary[32];
+        std::snprintf(boundary, sizeof(boundary), "bt.blk%d.out", i);
+        if (!write_f32_dump(dump_dir, boundary, bt.block_outputs[(size_t) i], {1, 690, 384}, mf)) return false;
+    }
+    if (!write_f32_dump(dump_dir, "bt.output", bt.output, {1, 690, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "bt.task_language", bt.task_language, {1, 16, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "bt.obs_primary", bt.obs_primary, {1, 2, 256, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "bt.obs_wrist", bt.obs_wrist, {1, 2, 64, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "bt.obs_task_language", bt.obs_task_language, {1, 2, 16, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "bt.readout_action", bt.readout_action, {1, 2, 1, 384}, mf)) return false;
+
+    OctoDiffusionWeights diffusion_w;
+    if (!read_diffusion_weights(g, diffusion_w)) return false;
+    OctoDiffusionResult diff;
+    if (!run_diffusion_replay(diffusion_w, case_dir, bt.readout_action, diff)) return false;
+    if (!write_f32_dump(dump_dir, "diff.initial_noise", diff.initial_noise, {1, 2, 28}, mf)) return false;
+    if (!write_bool_dump(dump_dir, "diff.action_mask", diff.action_mask, {1, 2, 4, 7}, mf)) return false;
+    if (!write_bool_dump(dump_dir, "diff.flat_action_mask", diff.flat_action_mask, {1, 2, 28}, mf)) return false;
+    for (int step = 0; step < 20; ++step) {
+        char boundary[64];
+        std::snprintf(boundary, sizeof(boundary), "diff.step%02d.current_x_before", step);
+        if (!write_f32_dump(dump_dir, boundary, diff.current_x_before[(size_t) step], {1, 2, 28}, mf)) return false;
+        std::snprintf(boundary, sizeof(boundary), "diff.step%02d.pred_eps", step);
+        if (!write_f32_dump(dump_dir, boundary, diff.pred_eps[(size_t) step], {1, 2, 28}, mf)) return false;
+        std::snprintf(boundary, sizeof(boundary), "diff.step%02d.z", step);
+        if (!write_f32_dump(dump_dir, boundary, diff.z[(size_t) step], {1, 2, 28}, mf)) return false;
+        std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_denoise", step);
+        if (!write_f32_dump(dump_dir, boundary, diff.after_denoise[(size_t) step], {1, 2, 28}, mf)) return false;
+        std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_noise_add", step);
+        if (!write_f32_dump(dump_dir, boundary, diff.after_noise_add[(size_t) step], {1, 2, 28}, mf)) return false;
+        std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_clip", step);
+        if (!write_f32_dump(dump_dir, boundary, diff.after_clip[(size_t) step], {1, 2, 28}, mf)) return false;
+        std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_mask", step);
+        if (!write_f32_dump(dump_dir, boundary, diff.after_mask[(size_t) step], {1, 2, 28}, mf)) return false;
+    }
+    if (!write_f32_dump(dump_dir, "diff.actions_all_timesteps", diff.actions_all_timesteps, {1, 2, 4, 7}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "sample_actions.final_action_normalized", diff.final_actions, {1, 4, 7}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "action_final", diff.final_actions, {1, 4, 7}, mf)) return false;
     return true;
 }
 

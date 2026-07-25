@@ -20,6 +20,10 @@ BOUNDARY_MAP = {
     "obs.wrist.pos": "octo_transformer.obs_wrist.tokens_after_pos_embedding",
 }
 
+T5_BOUNDARY_MAP = {
+    "t5.out": "octo_transformer.task_language.tokens_after_tokenizer",
+}
+
 LANGUAGE_BOUNDARY_MAP = {
     "lang.proj": "octo_transformer.task_language.tokens_after_projection",
     "lang.pos": "octo_transformer.task_language.tokens_after_pos_embedding",
@@ -193,6 +197,8 @@ def main() -> int:
     ok = True
     print("boundary\tgolden\tshape\tmax_abs_err\tmax_rel_err\tcosine\tstatus\toracle_max_rel_err\toracle_status")
     boundary_map = dict(BOUNDARY_MAP)
+    if any(name in dump for name in T5_BOUNDARY_MAP):
+        boundary_map.update(T5_BOUNDARY_MAP)
     if any(name in dump for name in LANGUAGE_BOUNDARY_MAP):
         boundary_map.update(LANGUAGE_BOUNDARY_MAP)
     if any(name in dump for name in TRANSFORMER_BOUNDARY_MAP):
@@ -216,7 +222,8 @@ def main() -> int:
         if golden_shape != dump_shape:
             raise SystemExit(f"shape mismatch {dump_name}: dump={dump_shape} golden={golden_shape}")
         max_abs, max_rel, cos = stats(actual, golden)
-        boundary_tol = args.transformer_tol if dump_name.startswith("bt.") and dump_name not in ("bt.input", "bt.mask") else args.tol
+        is_transformer_tol = (dump_name.startswith("bt.") and dump_name not in ("bt.input", "bt.mask")) or dump_name == "t5.out"
+        boundary_tol = args.transformer_tol if is_transformer_tol else args.tol
         if dump_name.startswith("diff.") or dump_name == "action_final" or dump_name.startswith("sample_actions."):
             status = "PASS" if (max_abs == 0.0 if dump_dtype == "bool" else max_abs <= boundary_tol) else "FAIL"
         else:

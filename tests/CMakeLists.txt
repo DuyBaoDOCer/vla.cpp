@@ -19,6 +19,8 @@ target_compile_options(octo_parity_dump PRIVATE -Wall -Wextra)
 if(Python3_FOUND AND DEFINED ENV{VLA_OCTO_GOLDEN_DIR})
   foreach(OCTO_PARITY_CASE example_batch synthetic_zero synthetic_random second_timestep_padded wrist_valid_synthetic)
     if(EXISTS "$ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy")
+      # Oracle mode: --t5-inject feeds the golden tokens downstream; native T5 output is still
+      # dumped as "t5.out" and checked against golden independently (M5, TIP-006).
       add_test(
         NAME octo_parity_${OCTO_PARITY_CASE}
         COMMAND ${CMAKE_COMMAND}
@@ -27,6 +29,18 @@ if(Python3_FOUND AND DEFINED ENV{VLA_OCTO_GOLDEN_DIR})
           -DT5_INJECT=$ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy
           -DTRANSFORMER_TOL=2e-3
           -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity/${OCTO_PARITY_CASE}
+          -DDUMPER=$<TARGET_FILE:octo_parity_dump>
+          -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
+          -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
+          -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
+      # Native mode: no --t5-inject, T5-base encoder output drives the whole pipeline end-to-end.
+      add_test(
+        NAME octo_parity_native_${OCTO_PARITY_CASE}
+        COMMAND ${CMAKE_COMMAND}
+          -DCKPT=${CMAKE_SOURCE_DIR}/octo-small-1.5-f32.gguf
+          -DCASE_DIR=$ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}
+          -DTRANSFORMER_TOL=2e-3
+          -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity_native/${OCTO_PARITY_CASE}
           -DDUMPER=$<TARGET_FILE:octo_parity_dump>
           -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
           -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}

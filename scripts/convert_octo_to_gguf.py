@@ -46,7 +46,9 @@ OCTO_META: dict[str, Any] = {
 }
 
 IGNORED_PATTERNS = (
-    re.compile(r"module\.octo_transformer\.task_tokenizers\.language\.hf_model\."),
+    # tied duplicate of hf_model.shared.weight (same underlying tensor, both names
+    # appear in state_dict()); only shared.weight is mapped to octo.t5.tok_embd.weight.
+    re.compile(r"module\.octo_transformer\.task_tokenizers\.language\.hf_model\.encoder\.embed_tokens\.weight"),
 )
 
 
@@ -162,6 +164,31 @@ def map_key(pt_key: str) -> str | None:
     if m:
         return f"octo.head.diffusion.reverse.out.{m.group(1)}"
 
+    # T5-base encoder (google-t5/t5-base, frozen; module.*.hf_model.* was skipped at M0).
+    t5p = "octo_transformer.task_tokenizers.language.hf_model."
+    if k == t5p + "shared.weight":
+        return "octo.t5.tok_embd.weight"
+    m = re.fullmatch(re.escape(t5p) + r"encoder\.block\.(\d+)\.layer\.0\.layer_norm\.weight", k)
+    if m:
+        return f"octo.t5.blk.{m.group(1)}.attn_norm.weight"
+    m = re.fullmatch(re.escape(t5p) + r"encoder\.block\.(\d+)\.layer\.0\.SelfAttention\.(q|k|v|o)\.weight", k)
+    if m:
+        return f"octo.t5.blk.{m.group(1)}.attn_{m.group(2)}.weight"
+    m = re.fullmatch(re.escape(t5p) + r"encoder\.block\.0\.layer\.0\.SelfAttention\.relative_attention_bias\.weight", k)
+    if m:
+        return "octo.t5.blk.0.attn_rel_b.weight"
+    m = re.fullmatch(re.escape(t5p) + r"encoder\.block\.(\d+)\.layer\.1\.layer_norm\.weight", k)
+    if m:
+        return f"octo.t5.blk.{m.group(1)}.ffn_norm.weight"
+    m = re.fullmatch(re.escape(t5p) + r"encoder\.block\.(\d+)\.layer\.1\.DenseReluDense\.wi\.weight", k)
+    if m:
+        return f"octo.t5.blk.{m.group(1)}.ffn_up.weight"
+    m = re.fullmatch(re.escape(t5p) + r"encoder\.block\.(\d+)\.layer\.1\.DenseReluDense\.wo\.weight", k)
+    if m:
+        return f"octo.t5.blk.{m.group(1)}.ffn_down.weight"
+    if k == t5p + "encoder.final_layer_norm.weight":
+        return "octo.t5.output_norm.weight"
+
     return None
 
 
@@ -192,6 +219,10 @@ def _validate_required(mapped: dict[str, str]) -> list[str]:
         for sub in ("ln", "fc1", "fc2"):
             for leaf in ("weight", "bias"):
                 required.append(f"octo.head.diffusion.reverse.blk.{i}.{sub}.{leaf}")
+    required += ["octo.t5.tok_embd.weight", "octo.t5.blk.0.attn_rel_b.weight", "octo.t5.output_norm.weight"]
+    for i in range(12):
+        for stem in ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_o", "ffn_norm", "ffn_up", "ffn_down"):
+            required.append(f"octo.t5.blk.{i}.{stem}.weight")
     have = set(mapped.values())
     return [k for k in required if k not in have]
 
