@@ -37,6 +37,28 @@ TRANSFORMER_BOUNDARY_MAP = {
     "bt.readout_action": "block_transformer.timestep_output.readout_action.tokens",
 }
 
+DIFFUSION_BOUNDARY_MAP = {
+    "diff.initial_noise": "action_head.predict_action.initial_noise",
+    "diff.action_mask": "action_head.predict_action.action_mask",
+    "diff.flat_action_mask": "action_head.predict_action.flat_action_mask",
+    "diff.actions_all_timesteps": "action_head.predict_action.actions_all_timesteps",
+    "sample_actions.final_action_normalized": "sample_actions.final_action_normalized",
+    "action_final": "final_action",
+}
+
+for _step in range(20):
+    _time = 19 - _step
+    _prefix = f"action_head.predict_action.step_{_step:02d}.t_{_time:02d}"
+    DIFFUSION_BOUNDARY_MAP.update({
+        f"diff.step{_step:02d}.current_x_before": f"{_prefix}.current_x_before",
+        f"diff.step{_step:02d}.pred_eps": f"{_prefix}.pred_eps",
+        f"diff.step{_step:02d}.z": f"{_prefix}.z",
+        f"diff.step{_step:02d}.x_after_denoise": f"{_prefix}.current_x_after_denoise",
+        f"diff.step{_step:02d}.x_after_noise_add": f"{_prefix}.current_x_after_noise_add",
+        f"diff.step{_step:02d}.x_after_clip": f"{_prefix}.current_x_after_clip",
+        f"diff.step{_step:02d}.x_after_mask": f"{_prefix}.current_x_after_mask",
+    })
+
 
 def load_dump_manifest(path: Path) -> dict[str, tuple[Path, str, tuple[int, ...]]]:
     rows: dict[str, tuple[Path, str, tuple[int, ...]]] = {}
@@ -175,6 +197,8 @@ def main() -> int:
         boundary_map.update(LANGUAGE_BOUNDARY_MAP)
     if any(name in dump for name in TRANSFORMER_BOUNDARY_MAP):
         boundary_map.update(TRANSFORMER_BOUNDARY_MAP)
+    if any(name in dump for name in DIFFUSION_BOUNDARY_MAP):
+        boundary_map.update(DIFFUSION_BOUNDARY_MAP)
 
     for dump_name, golden_name in boundary_map.items():
         if dump_name not in dump:
@@ -193,7 +217,10 @@ def main() -> int:
             raise SystemExit(f"shape mismatch {dump_name}: dump={dump_shape} golden={golden_shape}")
         max_abs, max_rel, cos = stats(actual, golden)
         boundary_tol = args.transformer_tol if dump_name.startswith("bt.") and dump_name not in ("bt.input", "bt.mask") else args.tol
-        status = "PASS" if (max_abs == 0.0 if dump_dtype == "bool" else max_rel <= boundary_tol) else "FAIL"
+        if dump_name.startswith("diff.") or dump_name == "action_final" or dump_name.startswith("sample_actions."):
+            status = "PASS" if (max_abs == 0.0 if dump_dtype == "bool" else max_abs <= boundary_tol) else "FAIL"
+        else:
+            status = "PASS" if (max_abs == 0.0 if dump_dtype == "bool" else max_rel <= boundary_tol) else "FAIL"
         oracle_max_rel = None
         oracle_status = "SKIP"
         if oracle is not None:

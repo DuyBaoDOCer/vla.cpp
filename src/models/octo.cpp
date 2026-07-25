@@ -481,6 +481,21 @@ struct OctoTransformerWeights {
     std::vector<float> output_norm_w, output_norm_b, readout_pos;
 };
 
+struct OctoDiffusionBlockWeights {
+    std::vector<float> ln_w, ln_b;
+    std::vector<float> fc1_w, fc1_b;
+    std::vector<float> fc2_w, fc2_b;
+};
+
+struct OctoDiffusionWeights {
+    std::vector<float> time_fourier_w;
+    std::vector<float> cond0_w, cond0_b;
+    std::vector<float> cond1_w, cond1_b;
+    std::vector<float> reverse_in_w, reverse_in_b;
+    std::array<OctoDiffusionBlockWeights, 3> blocks;
+    std::vector<float> reverse_out_w, reverse_out_b;
+};
+
 static bool read_obs_weights(gguf_reader& g, const char * view, OctoObsWeights& w) {
     char name[160];
     for (int i = 0; i < 4; ++i) {
@@ -525,6 +540,34 @@ static bool read_transformer_weights(gguf_reader& g, OctoTransformerWeights& w) 
     w.output_norm_b = g.read_f32("octo.output_norm.bias");
     w.readout_pos   = g.read_f32("octo.readout.action.pos_embd");
     return !w.output_norm_w.empty() && !w.output_norm_b.empty() && w.readout_pos.size() >= 2 * 384;
+}
+
+static bool read_diffusion_weights(gguf_reader& g, OctoDiffusionWeights& w) {
+    w.time_fourier_w = g.read_f32("octo.head.diffusion.time_fourier.weight");
+    w.cond0_w = g.read_f32("octo.head.diffusion.cond.0.weight");
+    w.cond0_b = g.read_f32("octo.head.diffusion.cond.0.bias");
+    w.cond1_w = g.read_f32("octo.head.diffusion.cond.1.weight");
+    w.cond1_b = g.read_f32("octo.head.diffusion.cond.1.bias");
+    w.reverse_in_w = g.read_f32("octo.head.diffusion.reverse.in.weight");
+    w.reverse_in_b = g.read_f32("octo.head.diffusion.reverse.in.bias");
+    char name[160];
+    for (int i = 0; i < 3; ++i) {
+        OctoDiffusionBlockWeights& b = w.blocks[(size_t) i];
+        std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.ln.weight", i); b.ln_w = g.read_f32(name);
+        std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.ln.bias", i);   b.ln_b = g.read_f32(name);
+        std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.fc1.weight", i); b.fc1_w = g.read_f32(name);
+        std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.fc1.bias", i);   b.fc1_b = g.read_f32(name);
+        std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.fc2.weight", i); b.fc2_w = g.read_f32(name);
+        std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.fc2.bias", i);   b.fc2_b = g.read_f32(name);
+        if (b.ln_w.empty() || b.ln_b.empty() || b.fc1_w.empty() || b.fc1_b.empty() ||
+            b.fc2_w.empty() || b.fc2_b.empty()) return false;
+    }
+    w.reverse_out_w = g.read_f32("octo.head.diffusion.reverse.out.weight");
+    w.reverse_out_b = g.read_f32("octo.head.diffusion.reverse.out.bias");
+    return w.time_fourier_w.size() == 16 && w.cond0_w.size() == 64 * 32 && w.cond0_b.size() == 64 &&
+           w.cond1_w.size() == 32 * 64 && w.cond1_b.size() == 32 &&
+           w.reverse_in_w.size() == 256 * 444 && w.reverse_in_b.size() == 256 &&
+           w.reverse_out_w.size() == 28 * 256 && w.reverse_out_b.size() == 28;
 }
 
 static void standardize_conv_weight(const std::vector<float>& src,
@@ -815,6 +858,27 @@ struct OctoTransformerResult {
     std::vector<float> readout_action;
 };
 
+struct OctoDiffusionSchedule {
+    std::array<float, 20> betas{};
+    std::array<float, 20> alphas{};
+    std::array<float, 20> alpha_hats{};
+};
+
+struct OctoDiffusionResult {
+    std::vector<float> initial_noise;
+    std::vector<uint8_t> action_mask;
+    std::vector<uint8_t> flat_action_mask;
+    std::array<std::vector<float>, 20> current_x_before;
+    std::array<std::vector<float>, 20> pred_eps;
+    std::array<std::vector<float>, 20> z;
+    std::array<std::vector<float>, 20> after_denoise;
+    std::array<std::vector<float>, 20> after_noise_add;
+    std::array<std::vector<float>, 20> after_clip;
+    std::array<std::vector<float>, 20> after_mask;
+    std::vector<float> actions_all_timesteps;
+    std::vector<float> final_actions;
+};
+
 static bool assemble_transformer_input(const std::vector<float>& task_language,
                                        const std::vector<float>& obs_primary,
                                        const std::vector<float>& obs_wrist,
@@ -843,6 +907,217 @@ static bool assemble_transformer_input(const std::vector<float>& task_language,
         std::copy_n(readout_pos.begin() + (size_t) t * hidden, hidden,
                     input.begin() + dst + (size_t) 336 * hidden);
     }
+    return true;
+}
+
+static OctoDiffusionSchedule make_cosine_schedule() {
+    OctoDiffusionSchedule s;
+    constexpr int steps = 20;
+    constexpr double ds = 0.008;
+    constexpr double pi = 3.141592653589793238462643383279502884;
+    std::array<double, steps + 1> alpha_cum{};
+    for (int i = 0; i <= steps; ++i) {
+        const double t = (double) i / (double) steps;
+        const double v = std::cos((t + ds) / (1.0 + ds) * pi * 0.5);
+        alpha_cum[(size_t) i] = v * v;
+    }
+    const double first = alpha_cum[0];
+    float cum = 1.0f;
+    for (int i = 0; i < steps; ++i) {
+        const double a0 = alpha_cum[(size_t) i] / first;
+        const double a1 = alpha_cum[(size_t) i + 1] / first;
+        const float beta = (float) std::min(std::max(1.0 - a1 / a0, 0.0), 0.999);
+        s.betas[(size_t) i] = beta;
+        s.alphas[(size_t) i] = 1.0f - beta;
+        cum *= s.alphas[(size_t) i];
+        s.alpha_hats[(size_t) i] = cum;
+    }
+    return s;
+}
+
+static bool run_score_actor_graph(const OctoDiffusionWeights& w,
+                                  const std::vector<float>& readout_action,
+                                  const std::vector<float>& noisy_action,
+                                  int time_value,
+                                  std::vector<float>& pred_eps) {
+    constexpr int hidden = 384;
+    constexpr int action = 28;
+    constexpr int width = 2;
+    constexpr float ln_eps = 1e-6f;
+    constexpr float two_pi = 6.2831853071795864769f;
+    if (readout_action.size() != (size_t) hidden * width || noisy_action.size() != (size_t) action * width) return false;
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        std::fprintf(stderr, "vla(octo): ggml_backend_cpu_init failed for score actor graph\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, default_cpu_threads());
+    ggml_init_params gp = {(size_t) 16 * 1024 * 1024, nullptr, true};
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    std::vector<ggml_tensor *> tensors;
+    std::vector<std::vector<float>> payloads;
+    auto add_payload = [&](ggml_tensor * t, const std::vector<float>& data) {
+        tensors.push_back(t);
+        payloads.push_back(data);
+        return t;
+    };
+    auto make_1d = [&](const char * name, int64_t ne0, const std::vector<float>& data) {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0);
+        ggml_set_name(t, name);
+        return add_payload(t, data);
+    };
+    auto make_2d = [&](const char * name, int64_t ne0, int64_t ne1, const std::vector<float>& data) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+        ggml_set_name(t, name);
+        return add_payload(t, data);
+    };
+
+    ggml_tensor * time_w = make_2d("octo.head.diffusion.time_fourier.weight", 1, 16, w.time_fourier_w);
+    ggml_tensor * c0w = make_2d("octo.head.diffusion.cond.0.weight", 32, 64, w.cond0_w);
+    ggml_tensor * c0b = make_1d("octo.head.diffusion.cond.0.bias", 64, w.cond0_b);
+    ggml_tensor * c1w = make_2d("octo.head.diffusion.cond.1.weight", 64, 32, w.cond1_w);
+    ggml_tensor * c1b = make_1d("octo.head.diffusion.cond.1.bias", 32, w.cond1_b);
+    ggml_tensor * rinw = make_2d("octo.head.diffusion.reverse.in.weight", 444, 256, w.reverse_in_w);
+    ggml_tensor * rinb = make_1d("octo.head.diffusion.reverse.in.bias", 256, w.reverse_in_b);
+    ggml_tensor * routw = make_2d("octo.head.diffusion.reverse.out.weight", 256, 28, w.reverse_out_w);
+    ggml_tensor * routb = make_1d("octo.head.diffusion.reverse.out.bias", 28, w.reverse_out_b);
+
+    std::vector<float> time_data(width, (float) time_value);
+    ggml_tensor * time = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, width);
+    ggml_set_name(time, "action_head.time");
+    add_payload(time, time_data);
+    ggml_tensor * obs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, width);
+    ggml_set_name(obs, "action_head.readout_embedding");
+    add_payload(obs, readout_action);
+    ggml_tensor * actions = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, action, width);
+    ggml_set_name(actions, "action_head.noisy_action");
+    add_payload(actions, noisy_action);
+
+    ggml_tensor * f = ggml_scale(ctx, ggml_mul_mat(ctx, time_w, time), two_pi);
+    ggml_tensor * time_ff = ggml_concat(ctx, ggml_cos(ctx, f), ggml_sin(ctx, f), 0);
+    ggml_tensor * cond = ggml_silu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, c0w, time_ff), c0b));
+    cond = ggml_add(ctx, ggml_mul_mat(ctx, c1w, cond), c1b);
+    ggml_tensor * reverse_input = ggml_concat(ctx, ggml_concat(ctx, cond, obs, 0), actions, 0);
+    ggml_tensor * x = ggml_add(ctx, ggml_mul_mat(ctx, rinw, reverse_input), rinb);
+    char name[160];
+    for (int i = 0; i < 3; ++i) {
+        const OctoDiffusionBlockWeights& b = w.blocks[(size_t) i];
+        auto lnw = make_1d((std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.ln.weight", i), name), 256, b.ln_w);
+        auto lnb = make_1d((std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.ln.bias", i), name), 256, b.ln_b);
+        auto fc1w = make_2d((std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.fc1.weight", i), name), 256, 1024, b.fc1_w);
+        auto fc1b = make_1d((std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.fc1.bias", i), name), 1024, b.fc1_b);
+        auto fc2w = make_2d((std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.fc2.weight", i), name), 1024, 256, b.fc2_w);
+        auto fc2b = make_1d((std::snprintf(name, sizeof(name), "octo.head.diffusion.reverse.blk.%d.fc2.bias", i), name), 256, b.fc2_b);
+        ggml_tensor * residual = x;
+        ggml_tensor * h = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, ln_eps), lnw), lnb);
+        h = ggml_silu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, fc1w, h), fc1b));
+        h = ggml_add(ctx, ggml_mul_mat(ctx, fc2w, h), fc2b);
+        x = ggml_add(ctx, residual, h);
+    }
+    ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, routw, ggml_silu(ctx, x)), routb);
+    ggml_set_name(out, "action_head.pred_eps");
+    ggml_set_output(out);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 2048, false);
+    ggml_build_forward_expand(graph, out);
+    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
+        std::fprintf(stderr, "vla(octo): score actor ggml_gallocr_alloc_graph failed\n");
+        if (gallocr) ggml_gallocr_free(gallocr);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        ggml_backend_tensor_set(tensors[i], payloads[i].data(), 0, ggml_nbytes(tensors[i]));
+    }
+    const ggml_status st = ggml_backend_graph_compute(backend, graph);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "vla(octo): score actor ggml_backend_graph_compute failed (%d)\n", (int) st);
+        ggml_gallocr_free(gallocr);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    pred_eps.resize((size_t) action * width);
+    ggml_backend_tensor_get(out, pred_eps.data(), 0, ggml_nbytes(out));
+
+    ggml_gallocr_free(gallocr);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
+static bool load_f32_shape(const std::string& path, const std::vector<int64_t>& shape, std::vector<float>& dst) {
+    NpyF32 npy;
+    if (!parse_npy_f32(path, npy)) return false;
+    if (npy.shape != shape) {
+        std::fprintf(stderr, "vla(octo): %s unexpected shape\n", path.c_str());
+        return false;
+    }
+    dst = std::move(npy.data);
+    return true;
+}
+
+static bool run_diffusion_replay(const OctoDiffusionWeights& w,
+                                 const std::string& case_dir,
+                                 const std::vector<float>& readout_action,
+                                 OctoDiffusionResult& result) {
+    constexpr int steps = 20;
+    constexpr int width = 2;
+    constexpr int action = 28;
+    constexpr float max_action = 5.0f;
+    if (readout_action.size() != (size_t) 384 * width) return false;
+    const std::string prefix = case_dir + "/tensors/action_head.predict_action.";
+    if (!load_f32_shape(prefix + "initial_noise.npy", {1, 2, 28}, result.initial_noise)) return false;
+    NpyBool action_mask;
+    if (!parse_npy_bool(prefix + "action_mask.npy", action_mask) || action_mask.shape != std::vector<int64_t>({1, 2, 4, 7})) return false;
+    result.action_mask = std::move(action_mask.data);
+    NpyBool flat_mask;
+    if (!parse_npy_bool(prefix + "flat_action_mask.npy", flat_mask) || flat_mask.shape != std::vector<int64_t>({1, 2, 28})) return false;
+    result.flat_action_mask = std::move(flat_mask.data);
+
+    OctoDiffusionSchedule sched = make_cosine_schedule();
+    std::vector<float> x = result.initial_noise;
+    for (int step = 0; step < steps; ++step) {
+        const int time_value = steps - 1 - step;
+        char stem[96];
+        std::snprintf(stem, sizeof(stem), "step_%02d.t_%02d.", step, time_value);
+        result.current_x_before[(size_t) step] = x;
+        if (!run_score_actor_graph(w, readout_action, x, time_value, result.pred_eps[(size_t) step])) return false;
+        if (!load_f32_shape(prefix + stem + "z.npy", {1, 2, 28}, result.z[(size_t) step])) return false;
+
+        std::vector<float> y((size_t) width * action);
+        const float alpha = sched.alphas[(size_t) time_value];
+        const float beta = sched.betas[(size_t) time_value];
+        const float alpha_hat = sched.alpha_hats[(size_t) time_value];
+        const float alpha_1 = 1.0f / std::sqrt(alpha);
+        const float alpha_2 = (1.0f - alpha) / std::sqrt(1.0f - alpha_hat);
+        for (size_t i = 0; i < y.size(); ++i) y[i] = alpha_1 * (x[i] - alpha_2 * result.pred_eps[(size_t) step][i]);
+        result.after_denoise[(size_t) step] = y;
+        if (time_value > 0) {
+            const float sigma = std::sqrt(beta);
+            for (size_t i = 0; i < y.size(); ++i) y[i] += sigma * result.z[(size_t) step][i];
+        }
+        result.after_noise_add[(size_t) step] = y;
+        for (float& v : y) v = std::min(std::max(v, -max_action), max_action);
+        result.after_clip[(size_t) step] = y;
+        const float masked_noise_scale = std::sqrt(1.0f - alpha_hat);
+        for (size_t i = 0; i < y.size(); ++i) {
+            if (!result.flat_action_mask[i]) y[i] = masked_noise_scale * result.z[(size_t) step][i];
+        }
+        result.after_mask[(size_t) step] = y;
+        x = std::move(y);
+    }
+
+    result.actions_all_timesteps = x;
+    result.final_actions.assign(x.begin() + (size_t) action, x.begin() + (size_t) 2 * action);
     return true;
 }
 
@@ -1236,6 +1511,34 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
         if (!write_f32_dump(dump_dir, "bt.obs_wrist", bt.obs_wrist, {1, 2, 64, 384}, mf)) return false;
         if (!write_f32_dump(dump_dir, "bt.obs_task_language", bt.obs_task_language, {1, 2, 16, 384}, mf)) return false;
         if (!write_f32_dump(dump_dir, "bt.readout_action", bt.readout_action, {1, 2, 1, 384}, mf)) return false;
+
+        OctoDiffusionWeights diffusion_w;
+        if (!read_diffusion_weights(g, diffusion_w)) return false;
+        OctoDiffusionResult diff;
+        if (!run_diffusion_replay(diffusion_w, case_dir, bt.readout_action, diff)) return false;
+        if (!write_f32_dump(dump_dir, "diff.initial_noise", diff.initial_noise, {1, 2, 28}, mf)) return false;
+        if (!write_bool_dump(dump_dir, "diff.action_mask", diff.action_mask, {1, 2, 4, 7}, mf)) return false;
+        if (!write_bool_dump(dump_dir, "diff.flat_action_mask", diff.flat_action_mask, {1, 2, 28}, mf)) return false;
+        for (int step = 0; step < 20; ++step) {
+            char boundary[64];
+            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.current_x_before", step);
+            if (!write_f32_dump(dump_dir, boundary, diff.current_x_before[(size_t) step], {1, 2, 28}, mf)) return false;
+            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.pred_eps", step);
+            if (!write_f32_dump(dump_dir, boundary, diff.pred_eps[(size_t) step], {1, 2, 28}, mf)) return false;
+            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.z", step);
+            if (!write_f32_dump(dump_dir, boundary, diff.z[(size_t) step], {1, 2, 28}, mf)) return false;
+            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_denoise", step);
+            if (!write_f32_dump(dump_dir, boundary, diff.after_denoise[(size_t) step], {1, 2, 28}, mf)) return false;
+            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_noise_add", step);
+            if (!write_f32_dump(dump_dir, boundary, diff.after_noise_add[(size_t) step], {1, 2, 28}, mf)) return false;
+            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_clip", step);
+            if (!write_f32_dump(dump_dir, boundary, diff.after_clip[(size_t) step], {1, 2, 28}, mf)) return false;
+            std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_mask", step);
+            if (!write_f32_dump(dump_dir, boundary, diff.after_mask[(size_t) step], {1, 2, 28}, mf)) return false;
+        }
+        if (!write_f32_dump(dump_dir, "diff.actions_all_timesteps", diff.actions_all_timesteps, {1, 2, 4, 7}, mf)) return false;
+        if (!write_f32_dump(dump_dir, "sample_actions.final_action_normalized", diff.final_actions, {1, 4, 7}, mf)) return false;
+        if (!write_f32_dump(dump_dir, "action_final", diff.final_actions, {1, 4, 7}, mf)) return false;
     }
     return true;
 }
