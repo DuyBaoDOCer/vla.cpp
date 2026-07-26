@@ -423,6 +423,24 @@ static bool parse_npy_bool(const std::string& path, NpyBool& out) {
     return true;
 }
 
+// Some golden cases (e.g. tier2/bridge_debug, real-robot language-only conditioning)
+// never recorded a task-image tensor at all: no goal image was ever provided for
+// that dump, matching OctoModelPt.create_tasks(texts=...)'s own zero-fill for
+// absent task modalities (octo-pytorch/octo/model/octo_model_pt.py:139-152). Parse
+// the file if present (tier1's synthetic zero-content task image); zero-fill to
+// match obs's spatial shape if the file is simply absent.
+static bool parse_npy_u8_or_zero_task(const std::string& path, const NpyU8& obs, NpyU8& task) {
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) return parse_npy_u8(path, task);
+    if (obs.shape.size() != 5) {
+        std::fprintf(stderr, "vla(octo): cannot infer zero-fill task shape from obs\n");
+        return false;
+    }
+    task.shape = {1, obs.shape[2], obs.shape[3], obs.shape[4]};
+    task.data.assign((size_t) obs.shape[2] * obs.shape[3] * obs.shape[4], 0);
+    return true;
+}
+
 static bool parse_npy_i32(const std::string& path, NpyI32& out) {
     std::vector<uint8_t> bytes;
     if (!read_file_all(path, bytes)) return false;
@@ -447,11 +465,19 @@ static bool parse_npy_i32(const std::string& path, NpyI32& out) {
     if (pos + hlen > bytes.size()) return false;
     const std::string header(reinterpret_cast<const char *>(bytes.data() + pos), hlen);
     pos += hlen;
-    if (header.find("'descr': '<i4'") == std::string::npos &&
-        header.find("\"descr\": \"<i4\"") == std::string::npos &&
-        header.find("'descr': '=i4'") == std::string::npos &&
-        header.find("\"descr\": \"=i4\"") == std::string::npos) {
-        std::fprintf(stderr, "vla(octo): %s expected int32 .npy\n", path.c_str());
+    // Golden dump scripts aren't consistent about token-id width (tier1 uses int32,
+    // tier2/bridge_debug uses torch's default int64) -- accept either and downcast;
+    // token ids are always well within int32 range.
+    bool is_i32 = header.find("'descr': '<i4'") != std::string::npos ||
+                  header.find("\"descr\": \"<i4\"") != std::string::npos ||
+                  header.find("'descr': '=i4'") != std::string::npos ||
+                  header.find("\"descr\": \"=i4\"") != std::string::npos;
+    bool is_i64 = header.find("'descr': '<i8'") != std::string::npos ||
+                  header.find("\"descr\": \"<i8\"") != std::string::npos ||
+                  header.find("'descr': '=i8'") != std::string::npos ||
+                  header.find("\"descr\": \"=i8\"") != std::string::npos;
+    if (!is_i32 && !is_i64) {
+        std::fprintf(stderr, "vla(octo): %s expected int32 or int64 .npy\n", path.c_str());
         return false;
     }
     if (header.find("'fortran_order': False") == std::string::npos &&
@@ -473,12 +499,19 @@ static bool parse_npy_i32(const std::string& path, NpyI32& out) {
     }
     int64_t ne = 1;
     for (int64_t d : out.shape) ne *= d;
-    if (pos + (size_t) ne * sizeof(int32_t) > bytes.size()) {
+    const size_t elsz = is_i64 ? sizeof(int64_t) : sizeof(int32_t);
+    if (pos + (size_t) ne * elsz > bytes.size()) {
         std::fprintf(stderr, "vla(octo): %s truncated .npy payload\n", path.c_str());
         return false;
     }
     out.data.resize((size_t) ne);
-    std::memcpy(out.data.data(), bytes.data() + pos, (size_t) ne * sizeof(int32_t));
+    if (is_i64) {
+        std::vector<int64_t> tmp((size_t) ne);
+        std::memcpy(tmp.data(), bytes.data() + pos, (size_t) ne * elsz);
+        for (size_t i = 0; i < tmp.size(); ++i) out.data[i] = (int32_t) tmp[i];
+    } else {
+        std::memcpy(out.data.data(), bytes.data() + pos, (size_t) ne * elsz);
+    }
     return true;
 }
 
@@ -1492,30 +1525,37 @@ static void resize_to_planar_chw(const uint8_t * src_hwc, int sw, int sh, int ds
 }
 
 // Un-normalizes a [4,7] flattened action using octo.dataset_statistics's
-// "bridge_dataset" action mean/std (a*std+mean). Not verified against golden
-// (deferred to M8 -- golden lacks an unnormalized target).
-static bool unnormalize_bridge_action(gguf_reader& g, const std::vector<float>& normalized_28, std::vector<float>& unnorm_28) {
+// per-dataset action mean/std/mask: unnorm[d] = mask[d] ? norm[d]*std[d]+mean[d]
+// : norm[d] (dims with mask=false, e.g. bridge_dataset's gripper dim 6, are left
+// as-is -- confirmed against golden: final_action_unnormalized[...,6] ==
+// sample_actions.final_action_normalized[...,6] exactly, while masked-in dims
+// match a*std+mean to ~1e-5). dataset_key must match golden's
+// metadata.unnormalization.dataset (all shipped golden cases use "bridge_dataset").
+static bool unnormalize_action(gguf_reader& g, const std::string& dataset_key,
+                               const std::vector<float>& normalized_28, std::vector<float>& unnorm_28) {
     const std::string stats_json = g.str("octo.dataset_statistics");
     if (stats_json.empty()) {
         std::fprintf(stderr, "vla(octo): missing octo.dataset_statistics\n");
         return false;
     }
     nlohmann::json j = nlohmann::json::parse(stats_json, nullptr, false);
-    if (j.is_discarded() || !j.contains("bridge_dataset") || !j["bridge_dataset"].contains("action")) {
-        std::fprintf(stderr, "vla(octo): dataset_statistics missing bridge_dataset.action\n");
+    if (j.is_discarded() || !j.contains(dataset_key) || !j[dataset_key].contains("action")) {
+        std::fprintf(stderr, "vla(octo): dataset_statistics missing %s.action\n", dataset_key.c_str());
         return false;
     }
-    const auto& act = j["bridge_dataset"]["action"];
+    const auto& act = j[dataset_key]["action"];
     std::vector<float> mean = act.at("mean").get<std::vector<float>>();
     std::vector<float> stdv = act.at("std").get<std::vector<float>>();
-    if (mean.size() != 7 || stdv.size() != 7 || normalized_28.size() != 28) {
+    std::vector<bool> mask = act.at("mask").get<std::vector<bool>>();
+    if (mean.size() != 7 || stdv.size() != 7 || mask.size() != 7 || normalized_28.size() != 28) {
         std::fprintf(stderr, "vla(octo): unexpected dataset_statistics/action shape\n");
         return false;
     }
     unnorm_28.resize(28);
     for (int t = 0; t < 4; ++t) {
         for (int d = 0; d < 7; ++d) {
-            unnorm_28[(size_t) t * 7 + d] = normalized_28[(size_t) t * 7 + d] * stdv[(size_t) d] + mean[(size_t) d];
+            const float norm = normalized_28[(size_t) t * 7 + d];
+            unnorm_28[(size_t) t * 7 + d] = mask[(size_t) d] ? (norm * stdv[(size_t) d] + mean[(size_t) d]) : norm;
         }
     }
     return true;
@@ -1834,15 +1874,16 @@ bool octo_dump_gguf_inventory(const std::string& ckpt_path) {
 bool octo_dump_tokenizer_case(const std::string& ckpt_path,
                               const std::string& case_dir,
                               const std::string& dump_dir,
-                              const std::string& t5_inject_path) {
+                              const std::string& t5_inject_path,
+                              const std::string& unnorm_dataset) {
     gguf_reader g{"octo"};
     if (!g.open(ckpt_path)) return false;
 
     NpyU8 primary_obs, wrist_obs, primary_task, wrist_task;
     if (!parse_npy_u8(case_dir + "/tensors/input.observation.image_primary.npy", primary_obs)) return false;
     if (!parse_npy_u8(case_dir + "/tensors/input.observation.image_wrist.npy", wrist_obs)) return false;
-    if (!parse_npy_u8(case_dir + "/tensors/input.task.image_primary.npy", primary_task)) return false;
-    if (!parse_npy_u8(case_dir + "/tensors/input.task.image_wrist.npy", wrist_task)) return false;
+    if (!parse_npy_u8_or_zero_task(case_dir + "/tensors/input.task.image_primary.npy", primary_obs, primary_task)) return false;
+    if (!parse_npy_u8_or_zero_task(case_dir + "/tensors/input.task.image_wrist.npy", wrist_obs, wrist_task)) return false;
 
     OctoObsWeights primary_w, wrist_w;
     if (!read_obs_weights(g, "primary", primary_w)) return false;
@@ -1959,6 +2000,10 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
     if (!write_f32_dump(dump_dir, "diff.actions_all_timesteps", diff.actions_all_timesteps, {1, 2, 4, 7}, mf)) return false;
     if (!write_f32_dump(dump_dir, "sample_actions.final_action_normalized", diff.final_actions, {1, 4, 7}, mf)) return false;
     if (!write_f32_dump(dump_dir, "action_final", diff.final_actions, {1, 4, 7}, mf)) return false;
+
+    std::vector<float> unnorm_actions;
+    if (!unnormalize_action(g, unnorm_dataset, diff.final_actions, unnorm_actions)) return false;
+    if (!write_f32_dump(dump_dir, "action_final_unnormalized", unnorm_actions, {1, 4, 7}, mf)) return false;
     return true;
 }
 
@@ -2063,7 +2108,7 @@ bool octo_predict_from_images(const std::string& ckpt_path,
     std::mt19937 rng(rd());
     if (!run_diffusion_live(diffusion_w, bt.readout_action, rng, out.normalized)) return false;
 
-    if (!unnormalize_bridge_action(g, out.normalized, out.unnormalized)) return false;
+    if (!unnormalize_action(g, "bridge_dataset", out.normalized, out.unnormalized)) return false;
     return true;
 }
 

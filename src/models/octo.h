@@ -14,7 +14,8 @@ bool octo_dump_gguf_inventory(const std::string& ckpt_path);
 bool octo_dump_tokenizer_case(const std::string& ckpt_path,
                               const std::string& case_dir,
                               const std::string& dump_dir,
-                              const std::string& t5_inject_path = "");
+                              const std::string& t5_inject_path = "",
+                              const std::string& unnorm_dataset = "bridge_dataset");
 
 // T5 SentencePiece-unigram tokenization (vocab embedded in the GGUF at convert
 // time). Pads/truncates to octo.tokens.language (16), appends EOS, matching
@@ -28,7 +29,12 @@ bool octo_tokenize_text(const std::string& ckpt_path,
 struct OctoCliAction {
     std::vector<float> normalized;    ///< [4,7] normalized action; verified vs golden (M1-M5 parity).
     std::vector<float> unnormalized;  ///< [4,7] world-unit action via octo.dataset_statistics
-                                       ///< ("bridge_dataset"); NOT verified vs golden -- deferred to M8.
+                                       ///< ("bridge_dataset"). The unnormalize formula itself is
+                                       ///< verified vs golden (M8, see action_final_unnormalized in
+                                       ///< the ctest harness); this specific *live* CLI call is not,
+                                       ///< since it samples fresh diffusion noise each run (see
+                                       ///< TIP-007's Completion Report for why an exact-match golden
+                                       ///< comparison isn't meaningful for the live/stochastic path).
 };
 
 // Runs the full Octo pipeline (SmallStem x2 -> T5 encoder -> block transformer

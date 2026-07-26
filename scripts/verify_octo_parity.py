@@ -50,6 +50,12 @@ DIFFUSION_BOUNDARY_MAP = {
     "action_final": "final_action",
 }
 
+# The golden unnormalized-action tensor is named differently per case (tier1 uses
+# "final_action_unnormalized"; tier2/bridge_debug uses
+# "final_action_unnormalized_bridge_debug") -- resolved dynamically per golden
+# manifest rather than hardcoded, since the tensor name isn't a fixed contract.
+UNNORM_BOUNDARY_CANDIDATES = ("final_action_unnormalized", "final_action_unnormalized_bridge_debug")
+
 for _step in range(20):
     _time = 19 - _step
     _prefix = f"action_head.predict_action.step_{_step:02d}.t_{_time:02d}"
@@ -182,7 +188,15 @@ def main() -> int:
     ap.add_argument("--transformer-tol", type=float, default=2e-3)
     ap.add_argument("--oracle-tol", type=float, default=1e-4)
     ap.add_argument("--report", type=Path)
+    ap.add_argument(
+        "--known-mismatch", action="append", default=[], metavar="BOUNDARY:REASON",
+        help="boundary that is allowed to FAIL without failing the overall run (printed and "
+             "recorded as FAIL_KNOWN in the report, never silently dropped); repeatable")
     args = ap.parse_args()
+    known_mismatch = {}
+    for spec in args.known_mismatch:
+        boundary, _, reason = spec.partition(":")
+        known_mismatch[boundary] = reason or "(no reason given)"
 
     golden_manifest = json.loads((args.golden / "manifest.json").read_text(encoding="utf-8"))
     if golden_manifest.get("format") != "npy+manifest.v1":
@@ -205,6 +219,12 @@ def main() -> int:
         boundary_map.update(TRANSFORMER_BOUNDARY_MAP)
     if any(name in dump for name in DIFFUSION_BOUNDARY_MAP):
         boundary_map.update(DIFFUSION_BOUNDARY_MAP)
+    if "action_final_unnormalized" in dump:
+        matches = [name for name in UNNORM_BOUNDARY_CANDIDATES if name in tensors]
+        if not matches:
+            raise SystemExit(
+                f"action_final_unnormalized dumped but golden has none of {UNNORM_BOUNDARY_CANDIDATES}")
+        boundary_map["action_final_unnormalized"] = matches[0]
 
     for dump_name, golden_name in boundary_map.items():
         if dump_name not in dump:
@@ -224,7 +244,7 @@ def main() -> int:
         max_abs, max_rel, cos = stats(actual, golden)
         is_transformer_tol = (dump_name.startswith("bt.") and dump_name not in ("bt.input", "bt.mask")) or dump_name == "t5.out"
         boundary_tol = args.transformer_tol if is_transformer_tol else args.tol
-        if dump_name.startswith("diff.") or dump_name == "action_final" or dump_name.startswith("sample_actions."):
+        if dump_name.startswith("diff.") or dump_name in ("action_final", "action_final_unnormalized") or dump_name.startswith("sample_actions."):
             status = "PASS" if (max_abs == 0.0 if dump_dtype == "bool" else max_abs <= boundary_tol) else "FAIL"
         else:
             status = "PASS" if (max_abs == 0.0 if dump_dtype == "bool" else max_rel <= boundary_tol) else "FAIL"
@@ -241,7 +261,11 @@ def main() -> int:
             oracle_data = load_raw_bool(oracle_path, oracle_shape) if dump_dtype == "bool" else load_raw_float32(oracle_path, oracle_shape)
             _, oracle_max_rel, _ = stats(actual, oracle_data)
             oracle_status = "PASS" if oracle_max_rel <= args.oracle_tol else "FAIL"
-        ok = ok and status == "PASS" and oracle_status != "FAIL"
+        known_reason = None
+        if status == "FAIL" and dump_name in known_mismatch:
+            known_reason = known_mismatch[dump_name]
+            status = "FAIL_KNOWN"
+        ok = ok and status in ("PASS", "FAIL_KNOWN") and oracle_status != "FAIL"
         row = {
             "boundary": dump_name,
             "golden": golden_name,
@@ -254,9 +278,12 @@ def main() -> int:
             "oracle_max_rel_err": oracle_max_rel,
             "oracle_status": oracle_status,
         }
+        if known_reason is not None:
+            row["known_mismatch_reason"] = known_reason
         rows.append(row)
         oracle_rel_s = "" if oracle_max_rel is None else f"{oracle_max_rel:.6g}"
-        print(f"{dump_name}\t{golden_name}\t{list(dump_shape)}\t{max_abs:.6g}\t{max_rel:.6g}\t{cos:.9f}\t{status}\t{oracle_rel_s}\t{oracle_status}")
+        status_s = status if known_reason is None else f"{status} ({known_reason})"
+        print(f"{dump_name}\t{golden_name}\t{list(dump_shape)}\t{max_abs:.6g}\t{max_rel:.6g}\t{cos:.9f}\t{status_s}\t{oracle_rel_s}\t{oracle_status}")
 
     for i in range(12):
         dump_name = f"bt.blk{i}.out"
