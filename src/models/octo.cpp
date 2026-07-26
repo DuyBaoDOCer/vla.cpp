@@ -18,6 +18,9 @@
 #endif
 #include "gguf.h"
 
+#include "nlohmann/json.hpp"
+#include "sentencepiece_processor.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -29,6 +32,7 @@
 #include <fstream>
 #include <filesystem>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -1409,6 +1413,114 @@ static bool run_diffusion_replay(const OctoDiffusionWeights& w,
     return true;
 }
 
+// Same DDPM reverse process as run_diffusion_replay, but samples initial noise
+// and per-step z ~ N(0,1) fresh instead of replaying golden-dump noise (live
+// inference has no golden dir to replay from). action_mask/flat_action_mask are
+// all-true for octo-small-1.5 (real_action_dim == max_action_dim == 7, full
+// action_horizon), so the golden masked-noise-substitution step is a no-op here
+// and is omitted.
+static bool run_diffusion_live(const OctoDiffusionWeights& w,
+                               const std::vector<float>& readout_action,
+                               std::mt19937& rng,
+                               std::vector<float>& final_actions) {
+    constexpr int steps = 20;
+    constexpr int width = 2;
+    constexpr int action = 28;
+    constexpr float max_action = 5.0f;
+    if (readout_action.size() != (size_t) 384 * width) return false;
+
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> x((size_t) width * action);
+    for (float& v : x) v = normal(rng);
+
+    OctoDiffusionSchedule sched = make_cosine_schedule();
+    for (int step = 0; step < steps; ++step) {
+        const int time_value = steps - 1 - step;
+        std::vector<float> pred_eps;
+        if (!run_score_actor_graph(w, readout_action, x, time_value, pred_eps)) return false;
+
+        std::vector<float> y((size_t) width * action);
+        const float alpha = sched.alphas[(size_t) time_value];
+        const float beta = sched.betas[(size_t) time_value];
+        const float alpha_hat = sched.alpha_hats[(size_t) time_value];
+        const float alpha_1 = 1.0f / std::sqrt(alpha);
+        const float alpha_2 = (1.0f - alpha) / std::sqrt(1.0f - alpha_hat);
+        for (size_t i = 0; i < y.size(); ++i) y[i] = alpha_1 * (x[i] - alpha_2 * pred_eps[i]);
+        if (time_value > 0) {
+            const float sigma = std::sqrt(beta);
+            for (size_t i = 0; i < y.size(); ++i) y[i] += sigma * normal(rng);
+        }
+        for (float& v : y) v = std::min(std::max(v, -max_action), max_action);
+        x = std::move(y);
+    }
+
+    final_actions.assign(x.begin() + (size_t) action, x.begin() + (size_t) 2 * action);
+    return true;
+}
+
+static bool read_kv_u8_array(const gguf_reader& g, const char * key, std::vector<uint8_t>& out) {
+    const int64_t id = gguf_find_key(g.gctx, key);
+    if (id < 0) {
+        std::fprintf(stderr, "vla(octo): missing metadata %s\n", key);
+        return false;
+    }
+    if (gguf_get_kv_type(g.gctx, id) != GGUF_TYPE_ARRAY || gguf_get_arr_type(g.gctx, id) != GGUF_TYPE_UINT8) {
+        std::fprintf(stderr, "vla(octo): %s is not a UINT8 array\n", key);
+        return false;
+    }
+    const size_t n = gguf_get_arr_n(g.gctx, id);
+    const uint8_t * data = (const uint8_t *) gguf_get_arr_data(g.gctx, id);
+    out.assign(data, data + n);
+    return true;
+}
+
+// Nearest-neighbor resize from interleaved HWC RGB8 (arbitrary size) to a
+// dside x dside planar CHW RGB8 buffer, matching the [C,H,W] layout
+// run_one_obs_tokenizer_graph expects for its obs/task tensors.
+static void resize_to_planar_chw(const uint8_t * src_hwc, int sw, int sh, int dside, std::vector<uint8_t>& dst_chw) {
+    dst_chw.assign((size_t) 3 * dside * dside, 0);
+    for (int yy = 0; yy < dside; ++yy) {
+        const int sy = std::min(sh - 1, (int) ((int64_t) yy * sh / dside));
+        for (int xx = 0; xx < dside; ++xx) {
+            const int sx = std::min(sw - 1, (int) ((int64_t) xx * sw / dside));
+            const uint8_t * px = src_hwc + ((size_t) sy * sw + sx) * 3;
+            for (int c = 0; c < 3; ++c) {
+                dst_chw[((size_t) c * dside + yy) * dside + xx] = px[c];
+            }
+        }
+    }
+}
+
+// Un-normalizes a [4,7] flattened action using octo.dataset_statistics's
+// "bridge_dataset" action mean/std (a*std+mean). Not verified against golden
+// (deferred to M8 -- golden lacks an unnormalized target).
+static bool unnormalize_bridge_action(gguf_reader& g, const std::vector<float>& normalized_28, std::vector<float>& unnorm_28) {
+    const std::string stats_json = g.str("octo.dataset_statistics");
+    if (stats_json.empty()) {
+        std::fprintf(stderr, "vla(octo): missing octo.dataset_statistics\n");
+        return false;
+    }
+    nlohmann::json j = nlohmann::json::parse(stats_json, nullptr, false);
+    if (j.is_discarded() || !j.contains("bridge_dataset") || !j["bridge_dataset"].contains("action")) {
+        std::fprintf(stderr, "vla(octo): dataset_statistics missing bridge_dataset.action\n");
+        return false;
+    }
+    const auto& act = j["bridge_dataset"]["action"];
+    std::vector<float> mean = act.at("mean").get<std::vector<float>>();
+    std::vector<float> stdv = act.at("std").get<std::vector<float>>();
+    if (mean.size() != 7 || stdv.size() != 7 || normalized_28.size() != 28) {
+        std::fprintf(stderr, "vla(octo): unexpected dataset_statistics/action shape\n");
+        return false;
+    }
+    unnorm_28.resize(28);
+    for (int t = 0; t < 4; ++t) {
+        for (int d = 0; d < 7; ++d) {
+            unnorm_28[(size_t) t * 7 + d] = normalized_28[(size_t) t * 7 + d] * stdv[(size_t) d] + mean[(size_t) d];
+        }
+    }
+    return true;
+}
+
 static bool build_transformer_mask(const NpyBool& task_valid,
                                    const NpyBool& primary_valid,
                                    const NpyBool& wrist_valid,
@@ -1847,6 +1959,111 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
     if (!write_f32_dump(dump_dir, "diff.actions_all_timesteps", diff.actions_all_timesteps, {1, 2, 4, 7}, mf)) return false;
     if (!write_f32_dump(dump_dir, "sample_actions.final_action_normalized", diff.final_actions, {1, 4, 7}, mf)) return false;
     if (!write_f32_dump(dump_dir, "action_final", diff.final_actions, {1, 4, 7}, mf)) return false;
+    return true;
+}
+
+bool octo_tokenize_text(const std::string& ckpt_path,
+                        const std::string& text,
+                        std::vector<int32_t>& input_ids,
+                        std::vector<int32_t>& attention_mask) {
+    gguf_reader g{"octo"};
+    if (!g.open(ckpt_path)) return false;
+
+    std::vector<uint8_t> spm_bytes;
+    if (!read_kv_u8_array(g, "octo.tokenizer.spm_model", spm_bytes)) return false;
+    const uint32_t eos_id = g.has("octo.tokenizer.eos_id") ? g.u32("octo.tokenizer.eos_id") : 1;
+    const uint32_t pad_id = g.has("octo.tokenizer.pad_id") ? g.u32("octo.tokenizer.pad_id") : 0;
+    const int64_t max_length = g.has("octo.tokens.language") ? g.u32("octo.tokens.language") : 16;
+
+    sentencepiece::SentencePieceProcessor sp;
+    const auto status = sp.LoadFromSerializedProto(
+        absl::string_view(reinterpret_cast<const char *>(spm_bytes.data()), spm_bytes.size()));
+    if (!status.ok()) {
+        std::fprintf(stderr, "vla(octo): sentencepiece LoadFromSerializedProto failed: %s\n", status.ToString().c_str());
+        return false;
+    }
+
+    std::vector<int> ids = sp.EncodeAsIds(text);
+    if ((int64_t) ids.size() > max_length - 1) ids.resize((size_t) (max_length - 1));  // reserve 1 slot for EOS
+    input_ids.assign(ids.begin(), ids.end());
+    input_ids.push_back((int32_t) eos_id);
+    attention_mask.assign(input_ids.size(), 1);
+    input_ids.resize((size_t) max_length, (int32_t) pad_id);
+    attention_mask.resize((size_t) max_length, 0);
+    return true;
+}
+
+bool octo_predict_from_images(const std::string& ckpt_path,
+                              const uint8_t* primary_rgb, int primary_w, int primary_h,
+                              const uint8_t* wrist_rgb, int wrist_w, int wrist_h,
+                              const std::string& instruction,
+                              OctoCliAction& out) {
+    gguf_reader g{"octo"};
+    if (!g.open(ckpt_path)) return false;
+
+    std::vector<int32_t> input_ids, attention_mask;
+    if (!octo_tokenize_text(ckpt_path, instruction, input_ids, attention_mask)) return false;
+
+    OctoObsWeights primary_w_g, wrist_w_g;
+    if (!read_obs_weights(g, "primary", primary_w_g)) return false;
+    if (!read_obs_weights(g, "wrist", wrist_w_g)) return false;
+
+    auto build_obs_task = [](const uint8_t * rgb, int sw, int sh, int side, NpyU8& obs, NpyU8& task) {
+        std::vector<uint8_t> frame;
+        resize_to_planar_chw(rgb, sw, sh, side, frame);
+        obs.shape = {1, 2, 3, side, side};
+        obs.data.resize((size_t) 2 * 3 * side * side);
+        std::copy(frame.begin(), frame.end(), obs.data.begin());
+        std::copy(frame.begin(), frame.end(), obs.data.begin() + (ptrdiff_t) frame.size());
+        task.shape = {1, 3, side, side};
+        task.data.assign((size_t) 3 * side * side, 0);  // no goal image: language-only conditioning
+    };
+    NpyU8 primary_obs, primary_task, wrist_obs, wrist_task;
+    build_obs_task(primary_rgb, primary_w, primary_h, 256, primary_obs, primary_task);
+    build_obs_task(wrist_rgb, wrist_w, wrist_h, 128, wrist_obs, wrist_task);
+
+    std::vector<float> tok, primary_proj, primary_pos, wrist_proj, wrist_pos;
+    if (!run_one_obs_tokenizer_graph(primary_w_g, primary_obs, primary_task, 256, 256, tok, primary_proj, primary_pos)) return false;
+    if (!run_one_obs_tokenizer_graph(wrist_w_g, wrist_obs, wrist_task, 128, 64, tok, wrist_proj, wrist_pos)) return false;
+
+    OctoT5Weights t5_w;
+    if (!read_t5_weights(g, t5_w)) return false;
+    std::vector<float> t5_out;
+    if (!run_t5_encoder_graph(g, t5_w, input_ids, attention_mask, t5_out)) return false;
+
+    OctoLanguageWeights lang_w;
+    if (!read_language_weights(g, lang_w)) return false;
+    NpyF32 t5;
+    t5.shape = {1, 16, 768};
+    t5.data = t5_out;
+    std::vector<float> lang_proj, lang_pos, repeated;
+    if (!run_language_graph(lang_w, t5, lang_proj, lang_pos, repeated)) return false;
+
+    OctoTransformerWeights transformer_w;
+    if (!read_transformer_weights(g, transformer_w)) return false;
+    NpyBool task_valid, primary_valid, wrist_valid, timestep_valid;
+    task_valid.shape = {1};
+    task_valid.data = {1};
+    primary_valid.shape = {1, 2};
+    primary_valid.data = {1, 1};
+    wrist_valid.shape = {1, 2};
+    wrist_valid.data = {1, 1};
+    timestep_valid.shape = {1, 2};
+    timestep_valid.data = {0, 1};  // cold start: t=0 is padding, t=1 is the live frame (matches HistoryWrapper.reset)
+
+    OctoTransformerResult bt;
+    if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, bt.input)) return false;
+    std::vector<float> blocked_mask;
+    if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, bt.blocked_mask, blocked_mask)) return false;
+    if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, bt)) return false;
+
+    OctoDiffusionWeights diffusion_w;
+    if (!read_diffusion_weights(g, diffusion_w)) return false;
+    std::random_device rd;
+    std::mt19937 rng(rd());
+    if (!run_diffusion_live(diffusion_w, bt.readout_action, rng, out.normalized)) return false;
+
+    if (!unnormalize_bridge_action(g, out.normalized, out.unnormalized)) return false;
     return true;
 }
 

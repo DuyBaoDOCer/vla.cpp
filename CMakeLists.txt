@@ -25,6 +25,19 @@ FetchContent_Declare(llama
 )
 FetchContent_MakeAvailable(llama)
 
+# T5 SentencePiece tokenizer (Octo language instructions). Static, self-contained
+# (vendors its own abseil/protobuf-lite subset under third_party/) -- no shared
+# lib, no test binaries, no tcmalloc.
+set(SPM_ENABLE_SHARED   OFF CACHE BOOL "" FORCE)
+set(SPM_BUILD_TEST      OFF CACHE BOOL "" FORCE)
+set(SPM_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(sentencepiece
+    GIT_REPOSITORY https://github.com/google/sentencepiece
+    GIT_TAG        v0.2.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(sentencepiece)
+
 add_library(vla_core
     src/model.cpp
     src/models/smolvla.cpp
@@ -44,8 +57,10 @@ target_include_directories(vla_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${llama_SOURCE_DIR}/vendor
+    PRIVATE
+        ${sentencepiece_SOURCE_DIR}/src
 )
-target_link_libraries(vla_core PUBLIC llama ggml)
+target_link_libraries(vla_core PUBLIC llama ggml PRIVATE sentencepiece)
 
 if(GGML_CUDA)
     target_compile_definitions(vla_core PUBLIC GGML_USE_CUDA)

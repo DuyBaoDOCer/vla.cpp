@@ -80,6 +80,22 @@ def _f32(t: torch.Tensor) -> np.ndarray:
     return t.detach().to(dtype=torch.float32, device="cpu").contiguous().numpy()
 
 
+def _embed_tokenizer(writer: gguf.GGUFWriter, tokenizer_name: str = "t5-base") -> None:
+    """Embed the raw T5 SentencePiece unigram model (spiece.model) as a UINT8 GGUF
+    array (not a GGUF string: the serialized proto contains embedded NUL bytes,
+    which would truncate a null-terminated-string read). google-t5/t5-base's
+    tokenizer_name is "t5-base" (see octo-pytorch's octo_pretrain_config.py).
+    """
+    from huggingface_hub import hf_hub_download
+
+    spm_path = hf_hub_download(tokenizer_name, "spiece.model")
+    spm_bytes = Path(spm_path).read_bytes()
+    writer.add_array("octo.tokenizer.spm_model", spm_bytes)
+    # T5 unigram special tokens (fixed across all T5 SentencePiece vocabs): pad=0, eos=</s>=1.
+    writer.add_uint32("octo.tokenizer.eos_id", 1)
+    writer.add_uint32("octo.tokenizer.pad_id", 0)
+
+
 def _strip_prefix(key: str) -> str:
     return key.removeprefix("module.")
 
@@ -290,6 +306,7 @@ def main() -> int:
     for key, value in OCTO_META.items():
         _add_meta(writer, key, value)
     writer.add_string("octo.dataset_statistics", json.dumps(m.dataset_statistics, default=_json_default, sort_keys=True))
+    _embed_tokenizer(writer)
 
     rows = []
     for src, dst in sorted(mapped.items(), key=lambda kv: kv[1]):

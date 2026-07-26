@@ -19,8 +19,17 @@
 //
 //   vla-cli [--mmproj m.gguf] --ckpt c.gguf --image img.jpg [--image img2.jpg]
 //           --tokens id,id,... [--state f,f,...] [--pretty]
+//
+// --model octo is the exception: Octo tokenizes its own instruction text
+// in-process (TIP-007/M6), so that path takes raw images + text instead:
+//
+//   vla-cli --model octo --ckpt octo-small-1.5-f32.gguf
+//           --image-primary p.png --image-wrist w.png --instruction "..."
+//           [--normalized] [--pretty]
 
+#include "arch.h"
 #include "model.h"
+#include "models/octo.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_STATIC
@@ -101,8 +110,18 @@ void usage(const char * prog) {
         "  --image    image file, repeat for multi-view (decoded via stb_image)\n"
         "  --tokens   language token ids, comma-separated (tokenize in the client)\n"
         "  --state    proprioception floats, comma-separated (default zeros)\n"
-        "  --pretty   print one action row (max_action_dim values) per line\n",
-        prog);
+        "  --pretty   print one action row (max_action_dim values) per line\n"
+        "\n"
+        "octo mode (in-process SentencePiece tokenization, no --tokens needed):\n"
+        "  %s --model octo --ckpt octo-small-1.5-f32.gguf\n"
+        "     --image-primary p.png --image-wrist w.png --instruction \"...\" [--normalized] [--pretty]\n"
+        "  --model         octo (auto-detected from --ckpt if omitted)\n"
+        "  --image-primary primary camera view, single current frame\n"
+        "  --image-wrist   wrist camera view, single current frame\n"
+        "  --instruction   raw language instruction text\n"
+        "  --normalized    print the verified normalized action instead of the\n"
+        "                  un-normalized (world-unit, NOT verified vs golden -- M8) default\n",
+        prog, prog);
 }
 
 }  // namespace
@@ -111,6 +130,8 @@ int main(int argc, char ** argv) {
     std::string mmproj, ckpt, tokens_s, state_s;
     std::vector<std::string> image_paths;
     bool pretty = false;
+    std::string model_flag, image_primary, image_wrist, instruction;
+    bool normalized = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -124,10 +145,58 @@ int main(int argc, char ** argv) {
         else if (a == "--tokens")  tokens_s = need("--tokens");
         else if (a == "--state")   state_s = need("--state");
         else if (a == "--pretty")  pretty = true;
+        else if (a == "--model")          model_flag   = need("--model");
+        else if (a == "--image-primary")  image_primary = need("--image-primary");
+        else if (a == "--image-wrist")    image_wrist   = need("--image-wrist");
+        else if (a == "--instruction")    instruction   = need("--instruction");
+        else if (a == "--normalized")     normalized    = true;
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else { std::fprintf(stderr, "vla-cli: unknown argument %s\n", a.c_str()); usage(argv[0]); return 1; }
     }
-    if (ckpt.empty() || image_paths.empty() || tokens_s.empty()) { usage(argv[0]); return 1; }
+    if (ckpt.empty()) { usage(argv[0]); return 1; }
+
+    bool octo_mode = (model_flag == "octo");
+    if (!octo_mode && model_flag.empty() && (!image_primary.empty() || !image_wrist.empty() || !instruction.empty())) {
+        Arch arch;
+        if (detect_arch_from_ckpt(ckpt, &arch) && arch == Arch::OCTO) octo_mode = true;
+    }
+
+    if (octo_mode) {
+        if (image_primary.empty() || image_wrist.empty() || instruction.empty()) {
+            std::fprintf(stderr, "vla-cli: --model octo needs --image-primary, --image-wrist, and --instruction\n");
+            usage(argv[0]);
+            return 1;
+        }
+        std::vector<uint8_t> pbuf, wbuf;
+        int pw = 0, ph = 0, ww = 0, wh = 0;
+        if (!load_image(image_primary.c_str(), pbuf, pw, ph)) return 1;
+        if (!load_image(image_wrist.c_str(), wbuf, ww, wh)) return 1;
+
+        OctoCliAction result;
+        if (!octo_predict_from_images(ckpt, pbuf.data(), pw, ph, wbuf.data(), ww, wh, instruction, result)) {
+            std::fprintf(stderr, "vla-cli: octo predict failed\n");
+            return 2;
+        }
+        const std::vector<float> & act = normalized ? result.normalized : result.unnormalized;
+        if (!normalized) {
+            std::fprintf(stderr,
+                "vla-cli: printing UN-normalized action (world units, via octo.dataset_statistics "
+                "bridge_dataset); this path is NOT verified against golden yet (M8). "
+                "Pass --normalized for the verified normalized action.\n");
+        }
+        constexpr int64_t cols = 7;
+        if (pretty) {
+            for (size_t i = 0; i < act.size(); ++i)
+                std::printf("%.6g%c", act[i], ((int64_t) (i + 1) % cols == 0) ? '\n' : ' ');
+        } else {
+            std::printf("action_len=%zu\n", act.size());
+            for (float x : act) std::printf("%.9g\n", x);
+        }
+        std::fflush(stdout);
+        return 0;
+    }
+
+    if (image_paths.empty() || tokens_s.empty()) { usage(argv[0]); return 1; }
 
     // Validate the cheap args before loading the model.
     std::vector<int32_t> lang;
