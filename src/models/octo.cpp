@@ -1455,7 +1455,8 @@ static bool run_diffusion_replay(const OctoDiffusionWeights& w,
 static bool run_diffusion_live(const OctoDiffusionWeights& w,
                                const std::vector<float>& readout_action,
                                std::mt19937& rng,
-                               std::vector<float>& final_actions) {
+                               std::vector<float>& final_actions,
+                               std::vector<float>* initial_noise_out = nullptr) {
     constexpr int steps = 20;
     constexpr int width = 2;
     constexpr int action = 28;
@@ -1465,6 +1466,7 @@ static bool run_diffusion_live(const OctoDiffusionWeights& w,
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<float> x((size_t) width * action);
     for (float& v : x) v = normal(rng);
+    if (initial_noise_out) *initial_noise_out = x;  // diagnostic only; sampled above, doesn't perturb rng
 
     OctoDiffusionSchedule sched = make_cosine_schedule();
     for (int step = 0; step < steps; ++step) {
@@ -2109,6 +2111,87 @@ bool octo_predict_from_images(const std::string& ckpt_path,
     if (!run_diffusion_live(diffusion_w, bt.readout_action, rng, out.normalized)) return false;
 
     if (!unnormalize_action(g, "bridge_dataset", out.normalized, out.unnormalized)) return false;
+    return true;
+}
+
+bool octo_free_sample_case(const std::string& ckpt_path,
+                           const std::string& case_dir,
+                           int n_samples,
+                           uint32_t seed,
+                           std::vector<float>& samples_out,
+                           std::vector<float>& noise_out) {
+    if (n_samples <= 0) {
+        std::fprintf(stderr, "vla(octo): free-sample n_samples must be > 0\n");
+        return false;
+    }
+    gguf_reader g{"octo"};
+    if (!g.open(ckpt_path)) return false;
+
+    // Observation: load once from the golden case, exactly as octo_dump_tokenizer_case
+    // does (same helpers, same zero-fill fallback for cases with no task image).
+    NpyU8 primary_obs, wrist_obs, primary_task, wrist_task;
+    if (!parse_npy_u8(case_dir + "/tensors/input.observation.image_primary.npy", primary_obs)) return false;
+    if (!parse_npy_u8(case_dir + "/tensors/input.observation.image_wrist.npy", wrist_obs)) return false;
+    if (!parse_npy_u8_or_zero_task(case_dir + "/tensors/input.task.image_primary.npy", primary_obs, primary_task)) return false;
+    if (!parse_npy_u8_or_zero_task(case_dir + "/tensors/input.task.image_wrist.npy", wrist_obs, wrist_task)) return false;
+    NpyI32 input_ids, attention_mask;
+    if (!parse_npy_i32(case_dir + "/tensors/input.task.language_instruction.input_ids.npy", input_ids)) return false;
+    if (!parse_npy_i32(case_dir + "/tensors/input.task.language_instruction.attention_mask.npy", attention_mask)) return false;
+    NpyBool task_valid, primary_valid, wrist_valid, timestep_valid;
+    if (!parse_npy_bool(case_dir + "/tensors/input.task.pad_mask_dict.language_instruction.npy", task_valid) ||
+        !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_primary.npy", primary_valid) ||
+        !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_wrist.npy", wrist_valid) ||
+        !parse_npy_bool(case_dir + "/tensors/input.observation.timestep_pad_mask.npy", timestep_valid)) return false;
+    std::vector<uint8_t> blocked_bytes;
+    std::vector<float> blocked_mask;
+    if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, blocked_bytes, blocked_mask)) return false;
+
+    // Weights: read once (matches how OctoPt holds a loaded model in memory across
+    // repeated sample_actions() calls, rather than reloading per sample).
+    // run_t5_encoder_graph/run_transformer_graph move their weight arg's vectors into
+    // the ggml payload, so each of the N passes gets a fresh copy of just those two
+    // (T5, transformer) -- the move-based signatures are unchanged/reused as-is.
+    OctoObsWeights primary_w_g, wrist_w_g;
+    if (!read_obs_weights(g, "primary", primary_w_g)) return false;
+    if (!read_obs_weights(g, "wrist", wrist_w_g)) return false;
+    OctoT5Weights t5_w_master;
+    if (!read_t5_weights(g, t5_w_master)) return false;
+    OctoLanguageWeights lang_w;
+    if (!read_language_weights(g, lang_w)) return false;
+    OctoTransformerWeights transformer_w_master;
+    if (!read_transformer_weights(g, transformer_w_master)) return false;
+    OctoDiffusionWeights diffusion_w;
+    if (!read_diffusion_weights(g, diffusion_w)) return false;
+
+    samples_out.assign((size_t) n_samples * 4 * 7, 0.0f);
+    noise_out.assign((size_t) n_samples * 2 * 28, 0.0f);
+
+    for (int i = 0; i < n_samples; ++i) {
+        std::vector<float> tok, primary_proj, primary_pos, wrist_proj, wrist_pos;
+        if (!run_one_obs_tokenizer_graph(primary_w_g, primary_obs, primary_task, 256, 256, tok, primary_proj, primary_pos)) return false;
+        if (!run_one_obs_tokenizer_graph(wrist_w_g, wrist_obs, wrist_task, 128, 64, tok, wrist_proj, wrist_pos)) return false;
+
+        OctoT5Weights t5_w = t5_w_master;
+        std::vector<float> t5_out;
+        if (!run_t5_encoder_graph(g, t5_w, input_ids.data, attention_mask.data, t5_out)) return false;
+
+        NpyF32 t5;
+        t5.shape = {1, 16, 768};
+        t5.data = t5_out;
+        std::vector<float> lang_proj, lang_pos, repeated;
+        if (!run_language_graph(lang_w, t5, lang_proj, lang_pos, repeated)) return false;
+
+        OctoTransformerWeights transformer_w = transformer_w_master;
+        OctoTransformerResult bt;
+        if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, bt.input)) return false;
+        if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, bt)) return false;
+
+        std::mt19937 rng(seed + (uint32_t) i);
+        std::vector<float> sample, noise;
+        if (!run_diffusion_live(diffusion_w, bt.readout_action, rng, sample, &noise)) return false;
+        std::copy(sample.begin(), sample.end(), samples_out.begin() + (size_t) i * 28);
+        std::copy(noise.begin(), noise.end(), noise_out.begin() + (size_t) i * 56);
+    }
     return true;
 }
 

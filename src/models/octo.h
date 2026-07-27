@@ -51,4 +51,19 @@ bool octo_predict_from_images(const std::string& ckpt_path,
                               const std::string& instruction,
                               OctoCliAction& out);
 
+// TIP-009: statistical action-distribution parity. Loads the golden case's own
+// observation (SmallStem images, task-language input_ids/attention_mask, all
+// four pad masks) once, then runs the full pipeline (tokenizer -> T5 -> block
+// transformer -> diffusion) n_samples times end-to-end, each with fresh
+// N(0,1) diffusion noise seeded from std::mt19937(seed + i). Does not touch
+// any already-verified graph function's behavior; reuses them unchanged.
+// samples_out: [n_samples,4,7] normalized action, row-major, sample-major.
+// noise_out:   [n_samples,2,28] initial DDPM noise actually consumed, same layout.
+bool octo_free_sample_case(const std::string& ckpt_path,
+                           const std::string& case_dir,
+                           int n_samples,
+                           uint32_t seed,
+                           std::vector<float>& samples_out,
+                           std::vector<float>& noise_out);
+
 }  // namespace vla
