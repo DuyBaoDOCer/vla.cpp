@@ -192,11 +192,30 @@ def main() -> int:
         "--known-mismatch", action="append", default=[], metavar="BOUNDARY:REASON",
         help="boundary that is allowed to FAIL without failing the overall run (printed and "
              "recorded as FAIL_KNOWN in the report, never silently dropped); repeatable")
+    ap.add_argument(
+        "--exclude", action="append", default=[], metavar="TOKEN[,TOKEN...]",
+        help="boundary(es) to drop entirely before comparison (not printed, not counted as "
+             "FAIL) -- for cases whose golden legitimately doesn't have a matching tensor, e.g. "
+             "single-camera LIBERO golden omitting wrist. A boundary is excluded if TOKEN is an "
+             "exact match, or a substring of the boundary name (checked with both '_' and '.' "
+             "forms of TOKEN, so 'obs_wrist' matches 'obs.wrist.tok' and 'bt.obs_wrist' alike). "
+             "Repeatable and/or comma-separated. Unlike --known-mismatch, an excluded boundary "
+             "is never looked up in dump/golden at all, so it can't raise a missing-boundary "
+             "SystemExit either.")
     args = ap.parse_args()
     known_mismatch = {}
     for spec in args.known_mismatch:
         boundary, _, reason = spec.partition(":")
         known_mismatch[boundary] = reason or "(no reason given)"
+    exclude_tokens: list[str] = []
+    for spec in args.exclude:
+        exclude_tokens.extend(t.strip() for t in spec.split(",") if t.strip())
+
+    def is_excluded(name: str) -> bool:
+        return any(
+            name == token or token in name or token.replace("_", ".") in name
+            for token in exclude_tokens
+        )
 
     golden_manifest = json.loads((args.golden / "manifest.json").read_text(encoding="utf-8"))
     if golden_manifest.get("format") != "npy+manifest.v1":
@@ -225,6 +244,13 @@ def main() -> int:
             raise SystemExit(
                 f"action_final_unnormalized dumped but golden has none of {UNNORM_BOUNDARY_CANDIDATES}")
         boundary_map["action_final_unnormalized"] = matches[0]
+
+    excluded = [name for name in boundary_map if is_excluded(name)]
+    for name in excluded:
+        del boundary_map[name]
+    for name in excluded:
+        print(f"{name}\t<excluded>\t\t\t\t\tEXCLUDED\t\tSKIP")
+        rows.append({"boundary": name, "golden": None, "status": "EXCLUDED"})
 
     for dump_name, golden_name in boundary_map.items():
         if dump_name not in dump:

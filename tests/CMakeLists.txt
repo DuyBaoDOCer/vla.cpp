@@ -106,7 +106,67 @@ if(Python3_FOUND AND DEFINED ENV{VLA_OCTO_GOLDEN_DIR_TIER2})
   endif()
 endif()
 
+# LIBERO (window=1): golden traces from the cyrusneary octo-finetuned-libero checkpoint
+# (TIP-GOLD), a genuinely single-camera model -- its example_batch/finetune_config never fed
+# a wrist observation at all, so the golden has no octo_transformer.obs_wrist.* /
+# block_transformer...obs_wrist tensors, and its block_transformer.{input_tokens,attention_mask,
+# output_tokens} are shorter than the port's (vla.cpp always includes masked-but-present wrist
+# tokens in the full sequence -- numerically equivalent for downstream outputs, since a masked
+# token contributes nothing, but shape-incompatible for those specific full-sequence/wrist
+# boundaries). OCTO_LIBERO_EXCLUDE drops exactly those from comparison; every other boundary
+# (obs_primary, task_language, readout, diff.*, final_action(+unnormalized)) is still compared
+# at the same tolerance as bridge. See TIP-HARNESS report for the full rationale.
+# Gated on two env vars since neither the golden traces nor the LIBERO GGUF are committed:
+#   VLA_OCTO_LIBERO_GOLDEN_DIR -- root containing <case>/tensors/ + manifest.json per case
+#   VLA_OCTO_LIBERO_CKPT       -- path to the window=1 GGUF (scripts/convert_octo_to_gguf.py
+#                                 --ckpt <cyrusneary experiment dir> --step 60000)
+set(OCTO_LIBERO_UNNORM_DATASET libero_object)
+set(OCTO_LIBERO_EXCLUDE "bt.input,bt.mask,bt.output,obs_wrist")
+
+if(Python3_FOUND AND DEFINED ENV{VLA_OCTO_LIBERO_GOLDEN_DIR} AND DEFINED ENV{VLA_OCTO_LIBERO_CKPT})
+  foreach(OCTO_LIBERO_CASE example_frame synthetic_zero synthetic_ramp)
+    if(EXISTS "$ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy")
+      # Oracle mode: --t5-inject feeds the golden tokens downstream; native T5 output is still
+      # dumped as "t5.out" and checked against golden independently.
+      add_test(
+        NAME octo_parity_libero_${OCTO_LIBERO_CASE}
+        COMMAND ${CMAKE_COMMAND}
+          -DCKPT=$ENV{VLA_OCTO_LIBERO_CKPT}
+          -DCASE_DIR=$ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}
+          -DT5_INJECT=$ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy
+          -DTRANSFORMER_TOL=2e-3
+          -DUNNORM_DATASET=${OCTO_LIBERO_UNNORM_DATASET}
+          -DEXCLUDE=${OCTO_LIBERO_EXCLUDE}
+          -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity_libero/${OCTO_LIBERO_CASE}
+          -DDUMPER=$<TARGET_FILE:octo_parity_dump>
+          -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
+          -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
+          -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
+      # Native mode: no --t5-inject, T5-base encoder output drives the whole pipeline end-to-end.
+      add_test(
+        NAME octo_parity_libero_native_${OCTO_LIBERO_CASE}
+        COMMAND ${CMAKE_COMMAND}
+          -DCKPT=$ENV{VLA_OCTO_LIBERO_CKPT}
+          -DCASE_DIR=$ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}
+          -DTRANSFORMER_TOL=2e-3
+          -DUNNORM_DATASET=${OCTO_LIBERO_UNNORM_DATASET}
+          -DEXCLUDE=${OCTO_LIBERO_EXCLUDE}
+          -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity_libero_native/${OCTO_LIBERO_CASE}
+          -DDUMPER=$<TARGET_FILE:octo_parity_dump>
+          -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
+          -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
+          -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
+    endif()
+  endforeach()
+endif()
+
 add_executable(test_vision_common test_vision_common.cpp)
 target_include_directories(test_vision_common PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(test_vision_common PRIVATE -Wall -Wextra)
 add_test(NAME vision_common COMMAND test_vision_common)
+
+# Model-free tripwire for the final-action-slice formula (Blueprint risk item 1445/1492).
+# Always registered (no golden dir / GGUF needed), runs in well under a second.
+add_executable(octo_action_slice_test octo_action_slice_test.cpp)
+target_compile_options(octo_action_slice_test PRIVATE -Wall -Wextra)
+add_test(NAME octo_action_slice COMMAND octo_action_slice_test)
