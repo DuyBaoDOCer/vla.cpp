@@ -19,6 +19,11 @@ import gguf
 
 ARCH = "octo"
 MODEL_ID = "hf://rail-berkeley/octo-small-1.5"
+# window_size for the rail-berkeley/octo-small-1.5 bridge pretrain checkpoint (the
+# MODEL_ID default above). Used only as a last-resort fallback when converting that
+# default checkpoint and its window_size can't be read back out of its own config
+# (e.g. hf:// config.json fetch races) -- never used for a checkpoint passed via --ckpt.
+DEFAULT_BRIDGE_WINDOW_SIZE = 2
 
 OCTO_META: dict[str, Any] = {
     "architecture": "octo-small-1.5",
@@ -27,7 +32,6 @@ OCTO_META: dict[str, Any] = {
     "attention.head_count": 6,
     "feed_forward_length": 1536,
     "attention.layer_norm_eps": 1e-6,
-    "window_size": 2,
     "action.horizon": 4,
     "action.dim": 7,
     "readout.count": 1,
@@ -208,6 +212,65 @@ def map_key(pt_key: str) -> str | None:
     return None
 
 
+def _finetune_config_window_size(finetune_cfg: dict) -> int | None:
+    if "window_size" in finetune_cfg:
+        return int(finetune_cfg["window_size"])
+    return (
+        finetune_cfg.get("dataset_kwargs", {})
+        .get("traj_transform_kwargs", {})
+        .get("window_size")
+    )
+
+
+def _resolve_window_size(model: Any, ckpt_arg: str | None, ckpt_path: str,
+                          override: int | None) -> int:
+    """window_size actually trained into `model`'s checkpoint -- NOT a fixed constant,
+    since it differs between the rail-berkeley bridge pretrain (2) and LIBERO
+    finetunes such as cyrusneary/octo-finetuned-libero (1).
+
+    Priority: --window-size override > finetune_config.json next to the checkpoint
+    > model.config (from the checkpoint's own config.json, set by
+    OctoModelPt.load_pretrained_from_jax). finetune_config.json wins when both are
+    present: it is the fully-resolved per-run training recipe (real dataset_dir,
+    real dataset_kwargs_list, real save paths), whereas a checkpoint's saved
+    config.json can retain the base architecture's window_size (the pos-embedding
+    weight table's native shape, inherited unchanged from the octo-small-1.5
+    pretrain) even when the finetune's data pipeline only ever fed it 1 timestep --
+    confirmed by hand for cyrusneary/octo-finetuned-libero/2025-06-20_..._175739:
+    config.json says window_size=2, but finetune_config.json (matching every other
+    fact about that run -- 4 LIBERO datasets, primary-only image_obs_keys, 60000
+    steps) says window_size=1 both at top level and under
+    dataset_kwargs.traj_transform_kwargs.
+
+    If neither resolves AND a custom --ckpt was given, fail loudly rather than
+    silently guessing -- only the unmodified default MODEL_ID (rail-berkeley bridge,
+    which has no finetune_config.json) falls back to model.config, then to the
+    known bridge constant.
+    """
+    if override is not None:
+        return override
+
+    if ckpt_arg is not None:
+        finetune_cfg_path = Path(ckpt_path) / "finetune_config.json"
+        if finetune_cfg_path.exists():
+            finetune_cfg = json.loads(finetune_cfg_path.read_text())
+            ws = _finetune_config_window_size(finetune_cfg)
+            if ws is not None:
+                return int(ws)
+
+    cfg = getattr(model, "config", None)
+    if isinstance(cfg, dict) and "window_size" in cfg:
+        return int(cfg["window_size"])
+
+    if ckpt_arg is None:
+        return DEFAULT_BRIDGE_WINDOW_SIZE
+
+    raise SystemExit(
+        f"cannot determine window_size for checkpoint {ckpt_path!r} from "
+        "finetune_config.json or model.config; pass --window-size explicitly"
+    )
+
+
 def _validate_required(mapped: dict[str, str]) -> list[str]:
     required: list[str] = []
     for view in ("primary", "wrist"):
@@ -248,6 +311,16 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=Path("octo-small-1.5-f32.gguf"))
     ap.add_argument("--octo-root", type=Path, default=Path(__file__).resolve().parents[1] / "octo-pytorch")
     ap.add_argument("--allow-unmapped", action="store_true", help="write known mapped tensors and report unmapped keys instead of failing")
+    ap.add_argument("--ckpt", type=str, default=None,
+        help="path or HF id (hf://...) to a checkpoint dir to convert, e.g. an Octo "
+             "finetune experiment dir with config.json/dataset_statistics.json/<step>/. "
+             f"Default: {MODEL_ID!r} (the rail-berkeley bridge pretrain).")
+    ap.add_argument("--step", type=int, default=None,
+        help="checkpoint step to load from --ckpt (default: latest available step). "
+             "Ignored/invalid when --ckpt is an hf:// id.")
+    ap.add_argument("--window-size", type=int, default=None,
+        help="override window_size written to octo.window_size GGUF meta; only needed "
+             "if it can't be read from the checkpoint's config.json/finetune_config.json.")
     args = ap.parse_args()
 
     if args.octo_root.exists():
@@ -255,10 +328,16 @@ def main() -> int:
 
     from octo.model.octo_model_pt import OctoModelPt
 
-    print(f"loading {MODEL_ID} via OctoModelPt.load_pretrained_from_jax ...")
-    loaded = OctoModelPt.load_pretrained_from_jax(MODEL_ID, skip_keys_regex=".*hf_model")
+    model_id = args.ckpt if args.ckpt is not None else MODEL_ID
+    print(f"loading {model_id} via OctoModelPt.load_pretrained_from_jax (step={args.step}) ...")
+    loaded = OctoModelPt.load_pretrained_from_jax(model_id, step=args.step, skip_keys_regex=".*hf_model")
     m = loaded["octo_model"]
     sd = m.state_dict()
+
+    window_size = _resolve_window_size(m, args.ckpt, model_id, args.window_size)
+    print(f"window_size = {window_size} (from "
+          f"{'--window-size override' if args.window_size is not None else 'checkpoint config'})")
+    OCTO_META["window_size"] = window_size
 
     print("state_dict keys and shapes:")
     for key in sorted(sd):
