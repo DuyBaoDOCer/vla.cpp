@@ -45,11 +45,15 @@ struct OctoCliAction {
 // start: history filled with the first frame, only the latest slot valid). No
 // goal image (language-only conditioning): task image is zero-filled, matching
 // OctoModelPt.create_tasks(texts=...).
+// unnorm_dataset: octo.dataset_statistics key to un-normalize against; "" (default)
+// auto-resolves (VLA_OCTO_UNNORM_DATASET env var, else the sole key if unambiguous,
+// else "bridge_dataset" if present) -- see resolve_unnorm_dataset_key in octo.cpp.
 bool octo_predict_from_images(const std::string& ckpt_path,
                               const uint8_t* primary_rgb, int primary_w, int primary_h,
                               const uint8_t* wrist_rgb, int wrist_w, int wrist_h,
                               const std::string& instruction,
-                              OctoCliAction& out);
+                              OctoCliAction& out,
+                              const std::string& unnorm_dataset = "");
 
 // TIP-009: statistical action-distribution parity. Loads the golden case's own
 // observation (SmallStem images, task-language input_ids/attention_mask, all

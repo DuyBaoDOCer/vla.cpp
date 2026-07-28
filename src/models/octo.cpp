@@ -85,10 +85,7 @@ struct OctoModelArch : public ModelArchBase {
     gguf_reader io{"octo"};
     std::vector<ggml_tensor *> tensors;
 
-    std::vector<float> predict(const Inputs&) override {
-        std::fprintf(stderr, "vla(octo): predict is not implemented in M0; this loader only validates GGUF load/shape metadata\n");
-        return {};
-    }
+    std::vector<float> predict(const Inputs& in) override;
 };
 
 bool require_key(const gguf_reader& g, const char * key) {
@@ -463,6 +460,38 @@ static bool parse_npy_u8_or_zero_task(const std::string& path, const NpyU8& obs,
     }
     task.shape = {1, obs.shape[2], obs.shape[3], obs.shape[4]};
     task.data.assign((size_t) obs.shape[2] * obs.shape[3] * obs.shape[4], 0);
+    return true;
+}
+
+// Observation-side counterpart to parse_npy_u8_or_zero_task: some golden cases (the
+// cyrusneary LIBERO checkpoint, TIP-GOLD) come from a genuinely single-camera
+// finetune -- its example_batch/finetune_config never fed a wrist observation at all,
+// so tensors/input.observation.image_wrist.npy simply doesn't exist. Zero-fill to
+// {1, window_size, 3, side, side} if absent (matches
+// scripts/patch_libero_golden_for_harness.py's WRIST_IMAGE_SIZE=128 placeholder, now
+// built in so that script is no longer required). `used_real` reports which happened,
+// so the caller can mark the corresponding wrist_valid pad-mask entries false instead
+// of pretending a placeholder camera is a real, valid observation.
+static bool parse_npy_u8_or_zero_obs(const std::string& path, int window_size, int side,
+                                     NpyU8& obs, bool& used_real) {
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) {
+        used_real = true;
+        return parse_npy_u8(path, obs);
+    }
+    used_real = false;
+    obs.shape = {1, window_size, 3, side, side};
+    obs.data.assign((size_t) window_size * 3 * side * side, 0);
+    return true;
+}
+
+// Bool-array counterpart: zero-fill (all-False = "not valid") {1, window_size} if the
+// golden case has no wrist pad-mask file at all (same single-camera scenario above).
+static bool parse_npy_bool_or_zero(const std::string& path, int window_size, NpyBool& out) {
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) return parse_npy_bool(path, out);
+    out.shape = {1, window_size};
+    out.data.assign((size_t) window_size, 0);
     return true;
 }
 
@@ -1578,14 +1607,49 @@ static void resize_to_planar_chw(const uint8_t * src_hwc, int sw, int sh, int ds
     }
 }
 
+// Resolves which top-level key of octo.dataset_statistics to un-normalize against when
+// the caller didn't pin one down explicitly (dataset_key_in empty). Priority:
+//   1. VLA_OCTO_UNNORM_DATASET env var -- the per-checkpoint-config idiom this codebase
+//      already uses for things a loaded GGUF can't self-describe (c.f. gr00t's
+//      VLA_GR00T_EMBODIMENT); the only channel available to server predict(), which has
+//      no per-call CLI flag.
+//   2. dataset_statistics has exactly one top-level key -> unambiguous, use it.
+//   3. "bridge_dataset" if present -- preserves the historical hardcoded default for the
+//      rail-berkeley bridge pretrain checkpoint (whose dataset_statistics has ~25 OXE-mix
+//      keys, so rule 2 doesn't apply to it).
+// Otherwise: fail loudly rather than silently guessing among several real candidates
+// (e.g. cyrusneary's libero_object/libero_spatial/libero_goal/liber_o10).
+static bool resolve_unnorm_dataset_key(const nlohmann::json& stats, std::string& key) {
+    if (const char* env = std::getenv("VLA_OCTO_UNNORM_DATASET"); env && env[0] != '\0') {
+        key = env;
+        return true;
+    }
+    if (stats.is_object() && stats.size() == 1) {
+        key = stats.begin().key();
+        return true;
+    }
+    if (stats.is_object() && stats.contains("bridge_dataset")) {
+        key = "bridge_dataset";
+        return true;
+    }
+    std::fprintf(stderr,
+                 "vla(octo): cannot auto-resolve unnorm dataset key (%zu candidate keys in "
+                 "octo.dataset_statistics); set VLA_OCTO_UNNORM_DATASET or pass an explicit key "
+                 "(e.g. --unnorm-dataset libero_object)\n",
+                 stats.is_object() ? stats.size() : (size_t) 0);
+    return false;
+}
+
 // Un-normalizes a [4,7] flattened action using octo.dataset_statistics's
 // per-dataset action mean/std/mask: unnorm[d] = mask[d] ? norm[d]*std[d]+mean[d]
-// : norm[d] (dims with mask=false, e.g. bridge_dataset's gripper dim 6, are left
-// as-is -- confirmed against golden: final_action_unnormalized[...,6] ==
-// sample_actions.final_action_normalized[...,6] exactly, while masked-in dims
-// match a*std+mean to ~1e-5). dataset_key must match golden's
-// metadata.unnormalization.dataset (all shipped golden cases use "bridge_dataset").
-static bool unnormalize_action(gguf_reader& g, const std::string& dataset_key,
+// : norm[d] (dims with mask=false, e.g. bridge_dataset's/libero_object's gripper dim 6,
+// are left as-is -- confirmed against golden: final_action_unnormalized[...,6] ==
+// sample_actions.final_action_normalized[...,6] exactly, while masked-in dims match
+// a*std+mean to ~1e-5). dataset_key_in must match golden's metadata.unnormalization.dataset
+// when comparing against a golden trace (all shipped bridge golden cases use
+// "bridge_dataset"); pass "" to auto-resolve via resolve_unnorm_dataset_key (live/serving
+// paths, where there's no golden to match against).
+static bool unnormalize_action(gguf_reader& g, const std::string& dataset_key_in,
                                const std::vector<float>& normalized_28, std::vector<float>& unnorm_28) {
     const std::string stats_json = g.str("octo.dataset_statistics");
     if (stats_json.empty()) {
@@ -1593,7 +1657,13 @@ static bool unnormalize_action(gguf_reader& g, const std::string& dataset_key,
         return false;
     }
     nlohmann::json j = nlohmann::json::parse(stats_json, nullptr, false);
-    if (j.is_discarded() || !j.contains(dataset_key) || !j[dataset_key].contains("action")) {
+    if (j.is_discarded()) {
+        std::fprintf(stderr, "vla(octo): octo.dataset_statistics is not valid JSON\n");
+        return false;
+    }
+    std::string dataset_key = dataset_key_in;
+    if (dataset_key.empty() && !resolve_unnorm_dataset_key(j, dataset_key)) return false;
+    if (!j.contains(dataset_key) || !j[dataset_key].contains("action")) {
         std::fprintf(stderr, "vla(octo): dataset_statistics missing %s.action\n", dataset_key.c_str());
         return false;
     }
@@ -1945,8 +2015,10 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
     const int seq = octo_seq_len(window_size);
 
     NpyU8 primary_obs, wrist_obs, primary_task, wrist_task;
+    bool wrist_obs_real = true;
     if (!parse_npy_u8(case_dir + "/tensors/input.observation.image_primary.npy", primary_obs)) return false;
-    if (!parse_npy_u8(case_dir + "/tensors/input.observation.image_wrist.npy", wrist_obs)) return false;
+    if (!parse_npy_u8_or_zero_obs(case_dir + "/tensors/input.observation.image_wrist.npy",
+                                  window_size, 128, wrist_obs, wrist_obs_real)) return false;
     if (!parse_npy_u8_or_zero_task(case_dir + "/tensors/input.task.image_primary.npy", primary_obs, primary_task)) return false;
     if (!parse_npy_u8_or_zero_task(case_dir + "/tensors/input.task.image_wrist.npy", wrist_obs, wrist_task)) return false;
 
@@ -2016,8 +2088,14 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
     NpyBool task_valid, primary_valid, wrist_valid, timestep_valid;
     if (!parse_npy_bool(case_dir + "/tensors/input.task.pad_mask_dict.language_instruction.npy", task_valid) ||
         !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_primary.npy", primary_valid) ||
-        !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_wrist.npy", wrist_valid) ||
+        !parse_npy_bool_or_zero(case_dir + "/tensors/input.observation.pad_mask_dict.image_wrist.npy", window_size, wrist_valid) ||
         !parse_npy_bool(case_dir + "/tensors/input.observation.timestep_pad_mask.npy", timestep_valid)) return false;
+    if (!wrist_obs_real) {
+        // Single-camera checkpoint: the wrist image is a zero-fill placeholder, not a
+        // real observation, regardless of what (if anything) the golden's own wrist
+        // pad-mask says -- never let the causal mask treat it as valid.
+        std::fill(wrist_valid.data.begin(), wrist_valid.data.end(), (uint8_t) 0);
+    }
 
     OctoTransformerResult bt;
     if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, window_size, bt.input)) return false;
@@ -2103,47 +2181,27 @@ bool octo_tokenize_text(const std::string& ckpt_path,
     return true;
 }
 
-bool octo_predict_from_images(const std::string& ckpt_path,
-                              const uint8_t* primary_rgb, int primary_w, int primary_h,
-                              const uint8_t* wrist_rgb, int wrist_w, int wrist_h,
-                              const std::string& instruction,
-                              OctoCliAction& out) {
-    gguf_reader g{"octo"};
-    if (!g.open(ckpt_path)) return false;
-    const int window_size = (int) g.u32("octo.window_size");
-    if (window_size < 1 || window_size > kMaxHorizon) {
-        std::fprintf(stderr, "vla(octo): octo.window_size=%d out of supported range [1, %d]\n",
-                     window_size, kMaxHorizon);
-        return false;
-    }
-
-    std::vector<int32_t> input_ids, attention_mask;
-    if (!octo_tokenize_text(ckpt_path, instruction, input_ids, attention_mask)) return false;
-
+// Shared tail of the live/cold-start prediction path: given already-assembled per-view
+// observation+task images (obs.shape={1,window_size,3,side,side}, task.shape={1,3,side,side})
+// and already-tokenized language, runs obs tokenizer x2 -> T5 encoder -> language ->
+// assemble -> causal mask -> block transformer -> diffusion head -> unnormalize. Used by
+// both octo_predict_from_images (CLI: tokenizes its own instruction via SentencePiece) and
+// OctoModelArch::predict (server: receives already-tokenized Inputs::lang_tokens from the
+// client, matching every other arch's client-tokenizes/server-embeds convention).
+// wrist_real=false marks the wrist observation as a zero-fill placeholder (single-camera
+// checkpoint or a caller that supplied no wrist view) -- its causal-mask key_valid entries
+// are forced false so the transformer treats it as absent padding, not a real observation.
+static bool octo_run_pipeline(gguf_reader& g, int window_size,
+                              const NpyU8& primary_obs, const NpyU8& primary_task,
+                              const NpyU8& wrist_obs, const NpyU8& wrist_task, bool wrist_real,
+                              const std::vector<int32_t>& input_ids,
+                              const std::vector<int32_t>& attention_mask,
+                              const std::string& unnorm_dataset,
+                              std::vector<float>& normalized_out,
+                              std::vector<float>& unnormalized_out) {
     OctoObsWeights primary_w_g, wrist_w_g;
     if (!read_obs_weights(g, "primary", primary_w_g)) return false;
     if (!read_obs_weights(g, "wrist", wrist_w_g)) return false;
-
-    // Cold start: only ONE live frame is available (a single vla-cli snapshot), but the
-    // model expects `window_size` observation timesteps. Repeat the live frame into
-    // every slot; timestep_valid below marks all-but-the-last as padding so the causal
-    // mask (build_transformer_mask) treats only the last slot as "real" -- this matches
-    // OctoPt's HistoryWrapper.reset() cold-start for window_size=2, and generalizes to
-    // window_size=1 (no padding slot at all, the single slot IS the live frame).
-    auto build_obs_task = [window_size](const uint8_t * rgb, int sw, int sh, int side, NpyU8& obs, NpyU8& task) {
-        std::vector<uint8_t> frame;
-        resize_to_planar_chw(rgb, sw, sh, side, frame);
-        obs.shape = {1, window_size, 3, side, side};
-        obs.data.resize((size_t) window_size * 3 * side * side);
-        for (int t = 0; t < window_size; ++t) {
-            std::copy(frame.begin(), frame.end(), obs.data.begin() + (ptrdiff_t) t * (ptrdiff_t) frame.size());
-        }
-        task.shape = {1, 3, side, side};
-        task.data.assign((size_t) 3 * side * side, 0);  // no goal image: language-only conditioning
-    };
-    NpyU8 primary_obs, primary_task, wrist_obs, wrist_task;
-    build_obs_task(primary_rgb, primary_w, primary_h, 256, primary_obs, primary_task);
-    build_obs_task(wrist_rgb, wrist_w, wrist_h, 128, wrist_obs, wrist_task);
 
     std::vector<float> tok, primary_proj, primary_pos, wrist_proj, wrist_pos;
     if (!run_one_obs_tokenizer_graph(primary_w_g, primary_obs, primary_task, 256, 256, window_size, tok, primary_proj, primary_pos)) return false;
@@ -2170,7 +2228,7 @@ bool octo_predict_from_images(const std::string& ckpt_path,
     primary_valid.shape = {1, window_size};
     primary_valid.data.assign((size_t) window_size, 1);
     wrist_valid.shape = {1, window_size};
-    wrist_valid.data.assign((size_t) window_size, 1);
+    wrist_valid.data.assign((size_t) window_size, wrist_real ? 1 : 0);
     timestep_valid.shape = {1, window_size};
     timestep_valid.data.assign((size_t) window_size, 0);
     timestep_valid.data.back() = 1;  // cold start: only the last slot is the live frame (matches HistoryWrapper.reset)
@@ -2185,10 +2243,125 @@ bool octo_predict_from_images(const std::string& ckpt_path,
     if (!read_diffusion_weights(g, diffusion_w)) return false;
     std::random_device rd;
     std::mt19937 rng(rd());
-    if (!run_diffusion_live(diffusion_w, bt.readout_action, window_size, rng, out.normalized)) return false;
+    if (!run_diffusion_live(diffusion_w, bt.readout_action, window_size, rng, normalized_out)) return false;
 
-    if (!unnormalize_action(g, "bridge_dataset", out.normalized, out.unnormalized)) return false;
-    return true;
+    return unnormalize_action(g, unnorm_dataset, normalized_out, unnormalized_out);
+}
+
+// Cold start: only ONE live frame is available (a single vla-cli snapshot or server
+// request), but the model expects `window_size` observation timesteps. Repeat the live
+// frame into every slot; the caller's timestep_valid marks all-but-the-last as padding
+// (see octo_run_pipeline) so the causal mask treats only the last slot as "real" -- matches
+// OctoPt's HistoryWrapper.reset() cold start for window_size=2, and generalizes to
+// window_size=1 (no padding slot at all, the single slot IS the live frame). No goal image
+// (language-only conditioning): task is zero-filled, matching OctoModelPt.create_tasks(texts=...).
+static void octo_build_cold_start_obs_task(const uint8_t* rgb, int sw, int sh, int side,
+                                           int window_size, NpyU8& obs, NpyU8& task) {
+    std::vector<uint8_t> frame;
+    resize_to_planar_chw(rgb, sw, sh, side, frame);
+    obs.shape = {1, window_size, 3, side, side};
+    obs.data.resize((size_t) window_size * 3 * side * side);
+    for (int t = 0; t < window_size; ++t) {
+        std::copy(frame.begin(), frame.end(), obs.data.begin() + (ptrdiff_t) t * (ptrdiff_t) frame.size());
+    }
+    task.shape = {1, 3, side, side};
+    task.data.assign((size_t) 3 * side * side, 0);
+}
+
+bool octo_predict_from_images(const std::string& ckpt_path,
+                              const uint8_t* primary_rgb, int primary_w, int primary_h,
+                              const uint8_t* wrist_rgb, int wrist_w, int wrist_h,
+                              const std::string& instruction,
+                              OctoCliAction& out,
+                              const std::string& unnorm_dataset) {
+    gguf_reader g{"octo"};
+    if (!g.open(ckpt_path)) return false;
+    const int window_size = (int) g.u32("octo.window_size");
+    if (window_size < 1 || window_size > kMaxHorizon) {
+        std::fprintf(stderr, "vla(octo): octo.window_size=%d out of supported range [1, %d]\n",
+                     window_size, kMaxHorizon);
+        return false;
+    }
+
+    std::vector<int32_t> input_ids, attention_mask;
+    if (!octo_tokenize_text(ckpt_path, instruction, input_ids, attention_mask)) return false;
+
+    NpyU8 primary_obs, primary_task, wrist_obs, wrist_task;
+    octo_build_cold_start_obs_task(primary_rgb, primary_w, primary_h, 256, window_size, primary_obs, primary_task);
+    octo_build_cold_start_obs_task(wrist_rgb, wrist_w, wrist_h, 128, window_size, wrist_obs, wrist_task);
+
+    return octo_run_pipeline(g, window_size, primary_obs, primary_task, wrist_obs, wrist_task,
+                             /*wrist_real=*/true, input_ids, attention_mask, unnorm_dataset,
+                             out.normalized, out.unnormalized);
+}
+
+// Server-facing entry point (vla-server, TIP-CLIENT): in.images[0] is the primary view,
+// in.images[1] the wrist view if the client sent one (single-camera checkpoints/clients
+// omit it -- zero-filled and masked invalid via octo_run_pipeline's wrist_real=false, same
+// fallback as the golden-case loaders above). Unlike most other archs' predict(), this
+// returns the UN-normalized (world-unit) action rather than the normalized one: Octo's
+// dataset_statistics lives embedded in the multi-hundred-MB checkpoint GGUF itself (not a
+// small sibling stats.json a client can cheaply hold locally the way gr00t's
+// --stats-json works), so un-normalizing server-side and reusing the already
+// golden-verified unnormalize_action() is the only practical option without shipping the
+// whole GGUF to the client just to read its JSON metadata. See TIP-CLIENT report for the
+// full rationale; the client (adapters.py) only needs to invert+binarize the gripper dim,
+// not repeat the mean/std un-normalization.
+std::vector<float> OctoModelArch::predict(const Inputs& in) {
+    if (in.n_images < 1 || !in.images) {
+        std::fprintf(stderr, "vla(octo): predict needs at least 1 image (primary)\n");
+        return {};
+    }
+    if (in.images[0].format != PixelFormat::U8) {
+        std::fprintf(stderr, "vla(octo): predict only supports PixelFormat::U8 images "
+                              "(client must send RGB_U8, already rotated+resized -- TIP-P)\n");
+        return {};
+    }
+    const bool wrist_real = in.n_images >= 2;
+    if (wrist_real && in.images[1].format != PixelFormat::U8) {
+        std::fprintf(stderr, "vla(octo): predict only supports PixelFormat::U8 images\n");
+        return {};
+    }
+    if (in.n_lang != (int) language_tokens || in.attention_mask_n != (int) language_tokens || !in.attention_mask) {
+        std::fprintf(stderr,
+                     "vla(octo): predict expects lang_tokens AND attention_mask of exactly %lld "
+                     "entries each (client tokenizes with t5-base, max_length=%lld, "
+                     "padding=\"max_length\" -- Octo's T5 encoder needs real padding info, unlike "
+                     "archs that derive their own mask); got n_lang=%d attention_mask=%s attention_mask_n=%d\n",
+                     (long long) language_tokens, (long long) language_tokens, in.n_lang,
+                     in.attention_mask ? "set" : "null", in.attention_mask_n);
+        return {};
+    }
+
+    gguf_reader g{"octo"};
+    if (!g.open(gguf_path)) {
+        std::fprintf(stderr, "vla(octo): predict: failed to reopen %s\n", gguf_path.c_str());
+        return {};
+    }
+
+    NpyU8 primary_obs, primary_task, wrist_obs, wrist_task;
+    octo_build_cold_start_obs_task((const uint8_t*) in.images[0].data, in.images[0].w, in.images[0].h,
+                                   256, (int) window_size, primary_obs, primary_task);
+    if (wrist_real) {
+        octo_build_cold_start_obs_task((const uint8_t*) in.images[1].data, in.images[1].w, in.images[1].h,
+                                       128, (int) window_size, wrist_obs, wrist_task);
+    } else {
+        wrist_obs.shape = {1, window_size, 3, 128, 128};
+        wrist_obs.data.assign((size_t) window_size * 3 * 128 * 128, 0);
+        wrist_task.shape = {1, 3, 128, 128};
+        wrist_task.data.assign((size_t) 3 * 128 * 128, 0);
+    }
+
+    const std::vector<int32_t> input_ids(in.lang_tokens, in.lang_tokens + in.n_lang);
+    const std::vector<int32_t> attention_mask(in.attention_mask, in.attention_mask + in.attention_mask_n);
+
+    std::vector<float> normalized, unnormalized;
+    if (!octo_run_pipeline(g, (int) window_size, primary_obs, primary_task, wrist_obs, wrist_task,
+                           wrist_real, input_ids, attention_mask, /*unnorm_dataset=*/"",
+                           normalized, unnormalized)) {
+        return {};
+    }
+    return unnormalized;
 }
 
 bool octo_free_sample_case(const std::string& ckpt_path,
@@ -2211,10 +2384,13 @@ bool octo_free_sample_case(const std::string& ckpt_path,
     }
 
     // Observation: load once from the golden case, exactly as octo_dump_tokenizer_case
-    // does (same helpers, same zero-fill fallback for cases with no task image).
+    // does (same helpers, same zero-fill fallback for cases with no task image or,
+    // for a single-camera checkpoint, no wrist observation at all).
     NpyU8 primary_obs, wrist_obs, primary_task, wrist_task;
+    bool wrist_obs_real = true;
     if (!parse_npy_u8(case_dir + "/tensors/input.observation.image_primary.npy", primary_obs)) return false;
-    if (!parse_npy_u8(case_dir + "/tensors/input.observation.image_wrist.npy", wrist_obs)) return false;
+    if (!parse_npy_u8_or_zero_obs(case_dir + "/tensors/input.observation.image_wrist.npy",
+                                  window_size, 128, wrist_obs, wrist_obs_real)) return false;
     if (!parse_npy_u8_or_zero_task(case_dir + "/tensors/input.task.image_primary.npy", primary_obs, primary_task)) return false;
     if (!parse_npy_u8_or_zero_task(case_dir + "/tensors/input.task.image_wrist.npy", wrist_obs, wrist_task)) return false;
     NpyI32 input_ids, attention_mask;
@@ -2223,8 +2399,11 @@ bool octo_free_sample_case(const std::string& ckpt_path,
     NpyBool task_valid, primary_valid, wrist_valid, timestep_valid;
     if (!parse_npy_bool(case_dir + "/tensors/input.task.pad_mask_dict.language_instruction.npy", task_valid) ||
         !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_primary.npy", primary_valid) ||
-        !parse_npy_bool(case_dir + "/tensors/input.observation.pad_mask_dict.image_wrist.npy", wrist_valid) ||
+        !parse_npy_bool_or_zero(case_dir + "/tensors/input.observation.pad_mask_dict.image_wrist.npy", window_size, wrist_valid) ||
         !parse_npy_bool(case_dir + "/tensors/input.observation.timestep_pad_mask.npy", timestep_valid)) return false;
+    if (!wrist_obs_real) {
+        std::fill(wrist_valid.data.begin(), wrist_valid.data.end(), (uint8_t) 0);
+    }
     std::vector<uint8_t> blocked_bytes;
     std::vector<float> blocked_mask;
     if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, window_size, blocked_bytes, blocked_mask)) return false;
