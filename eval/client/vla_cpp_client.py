@@ -55,6 +55,13 @@ ARCH_PRESETS = {
                    "max_state_dim": 64, "trust_remote_code": True},
 
     "gr00t_n1_6": {"image_size": 224, "tokenizer": None, "max_state_dim": 128, "trust_remote_code": True},
+
+    # cyrusneary/octo-finetuned-libero (window=1) is genuinely single-camera -- its own
+    # finetune_config.json image_obs_keys={"primary": "image"} never fed a wrist view, so
+    # OctoPipelineAdapter sends primary only; the server zero-fills+masks-invalid the wrist
+    # slot (matches training distribution exactly). No proprio/state input (Octo's
+    # observation_tokenizers are image-only, see octo_pretrain_config.py) -> max_state_dim=0.
+    "octo": {"image_size": 256, "tokenizer": "t5-base", "max_state_dim": 0, "max_length": 16},
 }
 
 BITVLA_N_PATCHES_PER_VIEW = 256
@@ -509,6 +516,8 @@ class VlaCppClient:
                 chunk = self._predict_chunk_vla_adapter(observations)
             elif self.arch == "openvla_oft":
                 chunk = self._predict_chunk_openvla_oft(observations)
+            elif self.arch == "octo":
+                chunk = self._predict_chunk_octo(observations)
             else:
                 chunk = self._predict_chunk(observations)
             for row in chunk[: self.n_action_steps, : self.real_action_dim]:
@@ -823,6 +832,66 @@ class VlaCppClient:
         if resp.error:
             raise RuntimeError(f"vla-server error: {resp.error}")
         self._last_response = resp
+        return (np.array(resp.action_chunk, dtype=np.float32)
+                  .reshape(resp.chunk_size, resp.action_dim))
+
+    def _predict_chunk_octo(self, observations: dict[str, Any]) -> np.ndarray:
+        # observations come from OctoPipelineAdapter.parse_observation (adapters.py):
+        # already rotate180+resize256/128'd uint8 HWC images (TIP-P), primary-only for the
+        # genuinely single-camera cyrusneary checkpoint (image2 sent too if present, for a
+        # future two-camera Octo checkpoint -- vla-server zero-fills+masks-invalid whichever
+        # view it doesn't receive, octo.cpp:predict()).
+        images_u8: list[np.ndarray] = []
+        for key in self.image_keys[:2]:
+            if key not in observations:
+                continue
+            img = observations[key]
+            if isinstance(img, torch.Tensor):
+                img = img.numpy()
+            img = np.asarray(img, dtype=np.uint8)
+            if img.ndim != 3 or img.shape[2] != 3:
+                raise ValueError(f"octo: {key} expected HWC uint8 [H,W,3], got {img.shape}")
+            images_u8.append(np.ascontiguousarray(img, dtype=np.uint8))
+        if not images_u8:
+            raise KeyError(f"octo: no image keys found in observations; got {list(observations.keys())}")
+
+        task = observations.get("task", "")
+        if isinstance(task, bytes):
+            task = task.decode()
+        # Same recipe as the checkpoint's own text_processor (octo_pretrain_config.py):
+        # t5-base, max_length=16, padding="max_length", truncation=True. Server's T5 encoder
+        # requires both input_ids and attention_mask at exactly this length (octo.cpp
+        # rejects anything else) -- unlike most archs, Octo needs the real mask, not a
+        # server-derived one.
+        toks = self.tok(task, return_tensors="np", padding="max_length",
+                        truncation=True, max_length=self.max_length)
+        input_ids = toks["input_ids"][0].astype(np.int32)
+        attn_mask = toks["attention_mask"][0].astype(np.int32)
+
+        req = self.pb.PredictRequest()
+        req.request_id = self._step
+        self._step += 1
+        for img in images_u8:
+            ip = req.images.add()
+            ip.encoding = self.pb.Image.RGB_U8
+            ip.height = img.shape[0]
+            ip.width  = img.shape[1]
+            ip.data   = img.tobytes()
+        req.lang_tokens.extend(input_ids.tolist())
+        req.attention_mask.extend(attn_mask.tolist())
+
+        self.sock.send(req.SerializeToString())
+        body = self.sock.recv()
+        resp = self.pb.PredictResponse()
+        resp.ParseFromString(body)
+        if resp.error:
+            raise RuntimeError(f"vla-server error: {resp.error}")
+        self._last_response = resp
+        # Already UN-normalized (world units) -- octo.cpp:predict() un-normalizes
+        # server-side (VLA_OCTO_UNNORM_DATASET / auto-resolve), unlike most archs which
+        # return normalized actions for the client to un-normalize via --stats-json. See
+        # TIP-CLIENT report for why (dataset_statistics is embedded in the multi-hundred-MB
+        # checkpoint GGUF, not a small sibling file a client can cheaply hold).
         return (np.array(resp.action_chunk, dtype=np.float32)
                   .reshape(resp.chunk_size, resp.action_dim))
 

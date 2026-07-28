@@ -177,3 +177,30 @@ class Gr00tN15PipelineAdapter(Gr00tPipelineAdapter):
 
     def parse_action(self, action: np.ndarray) -> np.ndarray:
         return np.asarray(action[:7], dtype=np.float32).copy()
+
+class OctoPipelineAdapter(BasePipelineAdapter):
+    """cyrusneary/octo-finetuned-libero (window=1). Primary camera only, matching this
+    checkpoint's own single-camera finetune (its finetune_config.json image_obs_keys
+    never included a wrist key) -- vla-server zero-fills+masks-invalid the wrist slot for
+    us (octo.cpp:predict(), TIP-CLIENT), exactly reproducing what the checkpoint actually
+    trained on. No proprio/state input: Octo's observation_tokenizers are image-only.
+    """
+
+    def __init__(self, client: Any = None):
+        super().__init__(client)
+
+    def parse_observation(self, obs: dict[str, Any]) -> dict[str, Any]:
+        primary = octo_preprocess_image(obs["pixels"]["image"], image_size=256)
+        return {
+            "observation.images.image": primary,
+            "task": obs.get("task_description", ""),
+        }
+
+    def parse_action(self, action: np.ndarray) -> np.ndarray:
+        # octo.cpp:predict() already un-normalized (world units, dims 0..5) -- only the
+        # gripper (dim 6, Octo's own +1=open/0=close convention, passthrough/un-masked by
+        # unnormalize_action) needs converting to LIBERO's -1=open/+1=close and binarizing.
+        # Same formula as Evo1PipelineAdapter/Gr00tPipelineAdapter above.
+        action = np.asarray(action[:7], dtype=np.float32).copy()
+        action[6] = -1.0 if action[6] > 0.5 else 1.0
+        return action
