@@ -16,12 +16,36 @@ import math
 from typing import Any
 import numpy as np
 import torch
+from PIL import Image
 from tree import map_structure
 
 from lerobot.envs.utils import preprocess_observation
 from lerobot.processor.env_processor import LiberoProcessorStep
 from lerobot.processor.pipeline import PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION
+
+def octo_preprocess_image(frame: np.ndarray, image_size: int = 256) -> np.ndarray:
+    """Octo LIBERO preprocessing segment 1 (raw sim frame -> model_entry image).
+
+    Two steps, matching OctoPt's get_libero_image / dlimp preprocessing:
+      1. Rotate 180 (`[::-1, ::-1]`) -- the raw off-screen render comes out upside-down,
+         same convention already handled for evo1/gr00t above (Evo1PipelineAdapter,
+         Gr00tPipelineAdapter).
+      2. Resize to `image_size`. LIBERO's sim renders at 256x256 and Octo's primary
+         tokenizer also expects 256x256, so with the sim kept at 256 (see TIP-CLIENT --
+         do not change LIBERO's camera_heights/widths away from 256) this resize is an
+         identity; PIL LANCZOS only actually resamples if the render size ever differs
+         from `image_size`.
+    Verified against golden tier-A (raw.npy/model_entry.npy pairs): exact on
+    lossless-JPEG synthetic frames, within JPEG round-trip noise (~20 uint8 max_abs) on
+    photographic ones -- see TIP-P report.
+    """
+    rotated = np.ascontiguousarray(frame[::-1, ::-1])
+    if rotated.shape[0] == image_size and rotated.shape[1] == image_size:
+        return rotated
+    resized = Image.fromarray(rotated).resize((image_size, image_size), resample=Image.LANCZOS)
+    return np.asarray(resized, dtype=np.uint8)
+
 
 class BasePipelineAdapter:
     def __init__(self, client: Any = None):
