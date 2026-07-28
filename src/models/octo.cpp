@@ -39,6 +39,22 @@
 namespace vla {
 namespace {
 
+// Per-timestep token count in the block-transformer sequence: primary(256) + wrist(64)
+// + repeated-language(16) + readout(1) = 337. Constant across window_size -- only the
+// number of timesteps (window_size) and the derived total seq length change.
+constexpr int kStepTokens = 337;
+// task_language prefix tokens (once, not repeated per timestep).
+constexpr int kTaskTokens = 16;
+// Shared max-horizon slab size of the obs/task pos-embedding tables written by
+// scripts/convert_octo_to_gguf.py (same for every checkpoint regardless of the
+// window_size actually trained/used) -- see TIP-C1. window_size must fit within it.
+constexpr int kMaxHorizon = 10;
+
+// seq = kTaskTokens + window_size * kStepTokens (window=2 -> 690, window=1 -> 353).
+inline int octo_seq_len(int64_t window_size) {
+    return kTaskTokens + (int) window_size * kStepTokens;
+}
+
 struct OctoModelArch : public ModelArchBase {
     OctoModelArch() : ModelArchBase(Arch::OCTO) {}
     ~OctoModelArch() override {
@@ -130,8 +146,17 @@ bool load_config(const gguf_reader& g, OctoModelArch& m) {
     m.diffusion_steps = g.u32("octo.diffusion.steps");
 
     if (m.hidden != 384 || m.blocks != 12 || m.heads != 6 || m.ffn != 1536 ||
-        m.window_size != 2 || m.action_horizon != 4 || m.action_dim != 7) {
+        m.action_horizon != 4 || m.action_dim != 7) {
         std::fprintf(stderr, "vla(octo): metadata does not match octo-small-1.5 M0 constants\n");
+        return false;
+    }
+    // window_size is per-checkpoint (bridge pretrain=2, LIBERO finetunes such as
+    // cyrusneary/octo-finetuned-libero=1); the pos-embedding table is a shared
+    // max_horizon=10 slab (see scripts/convert_octo_to_gguf.py), so any value in
+    // [1, kMaxHorizon] is a legal slice of it.
+    if (m.window_size < 1 || m.window_size > kMaxHorizon) {
+        std::fprintf(stderr, "vla(octo): octo.window_size=%lld out of supported range [1, %d]\n",
+                     (long long) m.window_size, kMaxHorizon);
         return false;
     }
 
@@ -740,25 +765,26 @@ static bool run_one_obs_tokenizer_graph(const OctoObsWeights& w,
                                         const NpyU8& task,
                                         int side,
                                         int n_tok,
+                                        int window_size,
                                         std::vector<float>& tok,
                                         std::vector<float>& proj,
                                         std::vector<float>& pos) {
     if (obs.shape.size() != 5 || task.shape.size() != 4 ||
-        obs.shape[0] != 1 || obs.shape[1] != 2 || obs.shape[2] != 3 ||
+        obs.shape[0] != 1 || obs.shape[1] != window_size || obs.shape[2] != 3 ||
         task.shape[0] != 1 || task.shape[1] != 3 ||
         obs.shape[3] != side || obs.shape[4] != side ||
         task.shape[2] != side || task.shape[3] != side) {
         std::fprintf(stderr, "vla(octo): unexpected input image shape for side=%d\n", side);
         return false;
     }
-    tok.assign((size_t) 1 * 2 * n_tok * 512, 0.0f);
-    proj.assign((size_t) 1 * 2 * n_tok * 384, 0.0f);
-    pos.assign((size_t) 1 * 2 * n_tok * 384, 0.0f);
+    tok.assign((size_t) 1 * window_size * n_tok * 512, 0.0f);
+    proj.assign((size_t) 1 * window_size * n_tok * 384, 0.0f);
+    pos.assign((size_t) 1 * window_size * n_tok * 384, 0.0f);
 
     const int stem_oc[4] = {32, 96, 192, 384};
     const int stem_ic[4] = {6, 32, 96, 192};
-    std::vector<float> input((size_t) side * side * 6 * 2, 0.0f);
-    for (int t = 0; t < 2; ++t) {
+    std::vector<float> input((size_t) side * side * 6 * window_size, 0.0f);
+    for (int t = 0; t < window_size; ++t) {
         for (int c = 0; c < 3; ++c) {
             for (int yy = 0; yy < side; ++yy) {
                 for (int xx = 0; xx < side; ++xx) {
@@ -802,7 +828,7 @@ static bool run_one_obs_tokenizer_graph(const OctoObsWeights& w,
         return out;
     };
 
-    ggml_tensor * x = make_4d(ctx, "octo.obs.input_norm", side, side, 6, 2);
+    ggml_tensor * x = make_4d(ctx, "octo.obs.input_norm", side, side, 6, window_size);
     add_payload(x, std::move(input));
 
     for (int li = 0; li < 4; ++li) {
@@ -839,14 +865,14 @@ static bool run_one_obs_tokenizer_graph(const OctoObsWeights& w,
     ggml_tensor * jb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 384, 1, 1);
     ggml_set_name(jb, "octo.obs.proj.bias");
     add_payload(jb, w.proj_b);
-    std::vector<float> pos2(w.pos.begin(), w.pos.begin() + (size_t) 2 * n_tok * 384);
-    ggml_tensor * pe = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 384, n_tok, 2);
-    ggml_set_name(pe, "octo.obs.pos_embd.window2");
+    std::vector<float> pos2(w.pos.begin(), w.pos.begin() + (size_t) window_size * n_tok * 384);
+    ggml_tensor * pe = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 384, n_tok, window_size);
+    ggml_set_name(pe, "octo.obs.pos_embd.window");
     add_payload(pe, std::move(pos2));
 
     ggml_tensor * patch = ggml_conv_2d(ctx, pw, x, 1, 1, 0, 0, 1, 1);
     patch = ggml_add(ctx, patch, pb);
-    ggml_tensor * tok_t = ggml_cont(ctx, ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, patch, 1, 2, 0, 3)), 512, n_tok, 2));
+    ggml_tensor * tok_t = ggml_cont(ctx, ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, patch, 1, 2, 0, 3)), 512, n_tok, window_size));
     ggml_set_name(tok_t, "obs.tokenizer.tok");
     ggml_set_output(tok_t);
 
@@ -891,6 +917,7 @@ static bool run_one_obs_tokenizer_graph(const OctoObsWeights& w,
 
 static bool run_language_graph(const OctoLanguageWeights& w,
                                const NpyF32& t5,
+                               int window_size,
                                std::vector<float>& proj,
                                std::vector<float>& pos,
                                std::vector<float>& repeated) {
@@ -900,7 +927,7 @@ static bool run_language_graph(const OctoLanguageWeights& w,
     }
     proj.assign((size_t) 1 * 16 * 384, 0.0f);
     pos.assign((size_t) 1 * 16 * 384, 0.0f);
-    repeated.assign((size_t) 1 * 2 * 16 * 384, 0.0f);
+    repeated.assign((size_t) 1 * window_size * 16 * 384, 0.0f);
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
@@ -943,7 +970,7 @@ static bool run_language_graph(const OctoLanguageWeights& w,
     ggml_tensor * pos_t = ggml_add(ctx, proj_t, pe);
     ggml_set_name(pos_t, "task_language.pos");
     ggml_set_output(pos_t);
-    ggml_tensor * repeated_t = ggml_repeat_4d(ctx, pos_t, 384, 16, 2, 1);
+    ggml_tensor * repeated_t = ggml_repeat_4d(ctx, pos_t, 384, 16, window_size, 1);
     ggml_set_name(repeated_t, "obs_task_language.repeated");
     ggml_set_output(repeated_t);
 
@@ -1209,21 +1236,22 @@ static bool assemble_transformer_input(const std::vector<float>& task_language,
                                        const std::vector<float>& obs_wrist,
                                        const std::vector<float>& repeated_language,
                                        const std::vector<float>& readout_pos,
+                                       int window_size,
                                        std::vector<float>& input) {
     constexpr int hidden = 384;
-    constexpr int seq = 690;
-    constexpr int step_tokens = 337;
+    const int seq = octo_seq_len(window_size);
+    constexpr int step_tokens = kStepTokens;
     if (task_language.size() != (size_t) 16 * hidden ||
-        obs_primary.size() != (size_t) 2 * 256 * hidden ||
-        obs_wrist.size() != (size_t) 2 * 64 * hidden ||
-        repeated_language.size() != (size_t) 2 * 16 * hidden ||
-        readout_pos.size() < (size_t) 2 * hidden) {
+        obs_primary.size() != (size_t) window_size * 256 * hidden ||
+        obs_wrist.size() != (size_t) window_size * 64 * hidden ||
+        repeated_language.size() != (size_t) window_size * 16 * hidden ||
+        readout_pos.size() < (size_t) window_size * hidden) {
         std::fprintf(stderr, "vla(octo): invalid tensor size while assembling block transformer input\n");
         return false;
     }
     input.assign((size_t) seq * hidden, 0.0f);
     std::copy(task_language.begin(), task_language.end(), input.begin());
-    for (int t = 0; t < 2; ++t) {
+    for (int t = 0; t < window_size; ++t) {
         const size_t dst = (size_t) (16 + t * step_tokens) * hidden;
         std::copy_n(obs_primary.begin() + (size_t) t * 256 * hidden, (size_t) 256 * hidden, input.begin() + dst);
         std::copy_n(obs_wrist.begin() + (size_t) t * 64 * hidden, (size_t) 64 * hidden, input.begin() + dst + (size_t) 256 * hidden);
@@ -1264,10 +1292,11 @@ static bool run_score_actor_graph(const OctoDiffusionWeights& w,
                                   const std::vector<float>& readout_action,
                                   const std::vector<float>& noisy_action,
                                   int time_value,
+                                  int window_size,
                                   std::vector<float>& pred_eps) {
     constexpr int hidden = 384;
     constexpr int action = 28;
-    constexpr int width = 2;
+    const int width = window_size;
     constexpr float ln_eps = 1e-6f;
     constexpr float two_pi = 6.2831853071795864769f;
     if (readout_action.size() != (size_t) hidden * width || noisy_action.size() != (size_t) action * width) return false;
@@ -1393,19 +1422,20 @@ static bool load_f32_shape(const std::string& path, const std::vector<int64_t>& 
 static bool run_diffusion_replay(const OctoDiffusionWeights& w,
                                  const std::string& case_dir,
                                  const std::vector<float>& readout_action,
+                                 int window_size,
                                  OctoDiffusionResult& result) {
     constexpr int steps = 20;
-    constexpr int width = 2;
+    const int width = window_size;
     constexpr int action = 28;
     constexpr float max_action = 5.0f;
     if (readout_action.size() != (size_t) 384 * width) return false;
     const std::string prefix = case_dir + "/tensors/action_head.predict_action.";
-    if (!load_f32_shape(prefix + "initial_noise.npy", {1, 2, 28}, result.initial_noise)) return false;
+    if (!load_f32_shape(prefix + "initial_noise.npy", {1, window_size, 28}, result.initial_noise)) return false;
     NpyBool action_mask;
-    if (!parse_npy_bool(prefix + "action_mask.npy", action_mask) || action_mask.shape != std::vector<int64_t>({1, 2, 4, 7})) return false;
+    if (!parse_npy_bool(prefix + "action_mask.npy", action_mask) || action_mask.shape != std::vector<int64_t>({1, window_size, 4, 7})) return false;
     result.action_mask = std::move(action_mask.data);
     NpyBool flat_mask;
-    if (!parse_npy_bool(prefix + "flat_action_mask.npy", flat_mask) || flat_mask.shape != std::vector<int64_t>({1, 2, 28})) return false;
+    if (!parse_npy_bool(prefix + "flat_action_mask.npy", flat_mask) || flat_mask.shape != std::vector<int64_t>({1, window_size, 28})) return false;
     result.flat_action_mask = std::move(flat_mask.data);
 
     OctoDiffusionSchedule sched = make_cosine_schedule();
@@ -1415,8 +1445,8 @@ static bool run_diffusion_replay(const OctoDiffusionWeights& w,
         char stem[96];
         std::snprintf(stem, sizeof(stem), "step_%02d.t_%02d.", step, time_value);
         result.current_x_before[(size_t) step] = x;
-        if (!run_score_actor_graph(w, readout_action, x, time_value, result.pred_eps[(size_t) step])) return false;
-        if (!load_f32_shape(prefix + stem + "z.npy", {1, 2, 28}, result.z[(size_t) step])) return false;
+        if (!run_score_actor_graph(w, readout_action, x, time_value, window_size, result.pred_eps[(size_t) step])) return false;
+        if (!load_f32_shape(prefix + stem + "z.npy", {1, window_size, 28}, result.z[(size_t) step])) return false;
 
         std::vector<float> y((size_t) width * action);
         const float alpha = sched.alphas[(size_t) time_value];
@@ -1442,7 +1472,19 @@ static bool run_diffusion_replay(const OctoDiffusionWeights& w,
     }
 
     result.actions_all_timesteps = x;
-    result.final_actions.assign(x.begin() + (size_t) action, x.begin() + (size_t) 2 * action);
+    // Final action chunk = the LAST timestep's readout (index window_size-1), matching
+    // OctoPt's sample_actions() which returns actions[:, -1] after the block-transformer
+    // diffusion head runs over the full observation window. For window_size=2 this is
+    // exactly the old hardcoded [action, 2*action) slice; for window_size=1 it is the
+    // sole timestep's block [0, action).
+    const size_t final_begin = (size_t) (window_size - 1) * action;
+    const size_t final_end   = (size_t) window_size * action;
+    if (final_end > x.size()) {
+        std::fprintf(stderr, "vla(octo): final action slice [%zu,%zu) out of bounds (x.size()=%zu)\n",
+                     final_begin, final_end, x.size());
+        return false;
+    }
+    result.final_actions.assign(x.begin() + (ptrdiff_t) final_begin, x.begin() + (ptrdiff_t) final_end);
     return true;
 }
 
@@ -1454,11 +1496,12 @@ static bool run_diffusion_replay(const OctoDiffusionWeights& w,
 // and is omitted.
 static bool run_diffusion_live(const OctoDiffusionWeights& w,
                                const std::vector<float>& readout_action,
+                               int window_size,
                                std::mt19937& rng,
                                std::vector<float>& final_actions,
                                std::vector<float>* initial_noise_out = nullptr) {
     constexpr int steps = 20;
-    constexpr int width = 2;
+    const int width = window_size;
     constexpr int action = 28;
     constexpr float max_action = 5.0f;
     if (readout_action.size() != (size_t) 384 * width) return false;
@@ -1472,7 +1515,7 @@ static bool run_diffusion_live(const OctoDiffusionWeights& w,
     for (int step = 0; step < steps; ++step) {
         const int time_value = steps - 1 - step;
         std::vector<float> pred_eps;
-        if (!run_score_actor_graph(w, readout_action, x, time_value, pred_eps)) return false;
+        if (!run_score_actor_graph(w, readout_action, x, time_value, window_size, pred_eps)) return false;
 
         std::vector<float> y((size_t) width * action);
         const float alpha = sched.alphas[(size_t) time_value];
@@ -1489,7 +1532,16 @@ static bool run_diffusion_live(const OctoDiffusionWeights& w,
         x = std::move(y);
     }
 
-    final_actions.assign(x.begin() + (size_t) action, x.begin() + (size_t) 2 * action);
+    // See run_diffusion_replay's matching comment: last-timestep readout, generalized
+    // from the old hardcoded [action, 2*action) slice.
+    const size_t final_begin = (size_t) (window_size - 1) * action;
+    const size_t final_end   = (size_t) window_size * action;
+    if (final_end > x.size()) {
+        std::fprintf(stderr, "vla(octo): final action slice [%zu,%zu) out of bounds (x.size()=%zu)\n",
+                     final_begin, final_end, x.size());
+        return false;
+    }
+    final_actions.assign(x.begin() + (ptrdiff_t) final_begin, x.begin() + (ptrdiff_t) final_end);
     return true;
 }
 
@@ -1567,15 +1619,16 @@ static bool build_transformer_mask(const NpyBool& task_valid,
                                    const NpyBool& primary_valid,
                                    const NpyBool& wrist_valid,
                                    const NpyBool& timestep_valid,
+                                   int window_size,
                                    std::vector<uint8_t>& blocked,
                                    std::vector<float>& blocked_f32) {
-    constexpr int seq = 690;
+    const int seq = octo_seq_len(window_size);
     constexpr int heads = 6;
-    constexpr int step_tokens = 337;
+    constexpr int step_tokens = kStepTokens;
     if (task_valid.shape != std::vector<int64_t>{1} ||
-        primary_valid.shape != std::vector<int64_t>({1, 2}) ||
-        wrist_valid.shape != std::vector<int64_t>({1, 2}) ||
-        timestep_valid.shape != std::vector<int64_t>({1, 2})) {
+        primary_valid.shape != std::vector<int64_t>({1, window_size}) ||
+        wrist_valid.shape != std::vector<int64_t>({1, window_size}) ||
+        timestep_valid.shape != std::vector<int64_t>({1, window_size})) {
         std::fprintf(stderr, "vla(octo): unexpected input pad-mask shape\n");
         return false;
     }
@@ -1588,7 +1641,7 @@ static bool build_transformer_mask(const NpyBool& task_valid,
         metadata.push_back({OctoTokenKind::TASK, -1});
         key_valid.push_back(task_valid.data[0] != 0);
     }
-    for (int t = 0; t < 2; ++t) {
+    for (int t = 0; t < window_size; ++t) {
         const uint8_t timestep_ok = timestep_valid.data[(size_t) t] != 0;
         for (int i = 0; i < 256; ++i) {
             metadata.push_back({OctoTokenKind::OBS, t});
@@ -1605,7 +1658,8 @@ static bool build_transformer_mask(const NpyBool& task_valid,
         metadata.push_back({OctoTokenKind::READOUT, t});
         key_valid.push_back(1);
     }
-    if (metadata.size() != seq || key_valid.size() != seq || 16 + 2 * step_tokens != seq) return false;
+    if (metadata.size() != (size_t) seq || key_valid.size() != (size_t) seq ||
+        16 + window_size * step_tokens != seq) return false;
 
     const size_t plane = (size_t) seq * seq;
     std::vector<uint8_t> blocked_one_head(plane, 0);
@@ -1641,12 +1695,13 @@ static bool build_transformer_mask(const NpyBool& task_valid,
 static bool run_transformer_graph(OctoTransformerWeights& w,
                                   const std::vector<float>& input,
                                   const std::vector<float>& blocked_mask,
+                                  int window_size,
                                   OctoTransformerResult& result) {
     constexpr int hidden = 384;
     constexpr int ffn = 1536;
     constexpr int heads = 6;
     constexpr int head_dim = 64;
-    constexpr int seq = 690;
+    const int seq = octo_seq_len(window_size);
     constexpr float ln_eps = 1e-6f;
     constexpr float attn_scale = 0.125f;
     if (input.size() != (size_t) hidden * seq || blocked_mask.size() != (size_t) seq * seq) return false;
@@ -1739,11 +1794,12 @@ static bool run_transformer_graph(OctoTransformerWeights& w,
     ggml_tensor * output = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, ln_eps), out_w), out_b);
     ggml_set_name(output, "bt.output");
     ggml_set_output(output);
+    constexpr int step_tokens = kStepTokens;
     ggml_tensor * split_task = ggml_cont(ctx, ggml_view_2d(ctx, output, hidden, 16, output->nb[1], 0));
-    ggml_tensor * split_primary = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 256, 2, output->nb[1], (size_t) 337 * output->nb[1], (size_t) 16 * output->nb[1]));
-    ggml_tensor * split_wrist = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 64, 2, output->nb[1], (size_t) 337 * output->nb[1], (size_t) 272 * output->nb[1]));
-    ggml_tensor * split_language = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 16, 2, output->nb[1], (size_t) 337 * output->nb[1], (size_t) 336 * output->nb[1]));
-    ggml_tensor * split_readout = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 1, 2, output->nb[1], (size_t) 337 * output->nb[1], (size_t) 352 * output->nb[1]));
+    ggml_tensor * split_primary = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 256, window_size, output->nb[1], (size_t) step_tokens * output->nb[1], (size_t) 16 * output->nb[1]));
+    ggml_tensor * split_wrist = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 64, window_size, output->nb[1], (size_t) step_tokens * output->nb[1], (size_t) 272 * output->nb[1]));
+    ggml_tensor * split_language = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 16, window_size, output->nb[1], (size_t) step_tokens * output->nb[1], (size_t) 336 * output->nb[1]));
+    ggml_tensor * split_readout = ggml_cont(ctx, ggml_view_3d(ctx, output, hidden, 1, window_size, output->nb[1], (size_t) step_tokens * output->nb[1], (size_t) 352 * output->nb[1]));
     for (ggml_tensor * t : {split_task, split_primary, split_wrist, split_language, split_readout}) ggml_set_output(t);
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
@@ -1880,6 +1936,13 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
                               const std::string& unnorm_dataset) {
     gguf_reader g{"octo"};
     if (!g.open(ckpt_path)) return false;
+    const int window_size = (int) g.u32("octo.window_size");
+    if (window_size < 1 || window_size > kMaxHorizon) {
+        std::fprintf(stderr, "vla(octo): octo.window_size=%d out of supported range [1, %d]\n",
+                     window_size, kMaxHorizon);
+        return false;
+    }
+    const int seq = octo_seq_len(window_size);
 
     NpyU8 primary_obs, wrist_obs, primary_task, wrist_task;
     if (!parse_npy_u8(case_dir + "/tensors/input.observation.image_primary.npy", primary_obs)) return false;
@@ -1907,15 +1970,15 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
     }
 
     std::vector<float> tok, proj, pos, primary_pos, wrist_pos;
-    if (!run_one_obs_tokenizer_graph(primary_w, primary_obs, primary_task, 256, 256, tok, proj, pos)) return false;
-    if (!write_f32_dump(dump_dir, "obs.primary.tok",  tok,  {1, 2, 256, 512}, mf)) return false;
-    if (!write_f32_dump(dump_dir, "obs.primary.proj", proj, {1, 2, 256, 384}, mf)) return false;
-    if (!write_f32_dump(dump_dir, "obs.primary.pos",  pos,  {1, 2, 256, 384}, mf)) return false;
+    if (!run_one_obs_tokenizer_graph(primary_w, primary_obs, primary_task, 256, 256, window_size, tok, proj, pos)) return false;
+    if (!write_f32_dump(dump_dir, "obs.primary.tok",  tok,  {1, window_size, 256, 512}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "obs.primary.proj", proj, {1, window_size, 256, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "obs.primary.pos",  pos,  {1, window_size, 256, 384}, mf)) return false;
     primary_pos = pos;
-    if (!run_one_obs_tokenizer_graph(wrist_w, wrist_obs, wrist_task, 128, 64, tok, proj, pos)) return false;
-    if (!write_f32_dump(dump_dir, "obs.wrist.tok",  tok,  {1, 2, 64, 512}, mf)) return false;
-    if (!write_f32_dump(dump_dir, "obs.wrist.proj", proj, {1, 2, 64, 384}, mf)) return false;
-    if (!write_f32_dump(dump_dir, "obs.wrist.pos",  pos,  {1, 2, 64, 384}, mf)) return false;
+    if (!run_one_obs_tokenizer_graph(wrist_w, wrist_obs, wrist_task, 128, 64, window_size, tok, proj, pos)) return false;
+    if (!write_f32_dump(dump_dir, "obs.wrist.tok",  tok,  {1, window_size, 64, 512}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "obs.wrist.proj", proj, {1, window_size, 64, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "obs.wrist.pos",  pos,  {1, window_size, 64, 384}, mf)) return false;
     wrist_pos = pos;
     // T5-base encoder: always computed natively (M5). --t5-inject, when given, overrides the
     // tokens fed downstream (oracle/fallback path); the native "t5.out" boundary is always
@@ -1943,10 +2006,10 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
     OctoLanguageWeights lang_w;
     if (!read_language_weights(g, lang_w)) return false;
     std::vector<float> lang_proj, lang_pos, repeated;
-    if (!run_language_graph(lang_w, t5, lang_proj, lang_pos, repeated)) return false;
+    if (!run_language_graph(lang_w, t5, window_size, lang_proj, lang_pos, repeated)) return false;
     if (!write_f32_dump(dump_dir, "lang.proj",         lang_proj, {1, 16, 384}, mf)) return false;
     if (!write_f32_dump(dump_dir, "lang.pos",          lang_pos,  {1, 16, 384}, mf)) return false;
-    if (!write_f32_dump(dump_dir, "repeated_language", repeated,  {1, 2, 16, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "repeated_language", repeated,  {1, window_size, 16, 384}, mf)) return false;
 
     OctoTransformerWeights transformer_w;
     if (!read_transformer_weights(g, transformer_w)) return false;
@@ -1957,49 +2020,49 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
         !parse_npy_bool(case_dir + "/tensors/input.observation.timestep_pad_mask.npy", timestep_valid)) return false;
 
     OctoTransformerResult bt;
-    if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, bt.input)) return false;
+    if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, window_size, bt.input)) return false;
     std::vector<float> blocked_mask;
-    if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, bt.blocked_mask, blocked_mask)) return false;
-    if (!write_f32_dump(dump_dir, "bt.input", bt.input, {1, 690, 384}, mf)) return false;
-    if (!write_bool_dump(dump_dir, "bt.mask", bt.blocked_mask, {6, 690, 690}, mf)) return false;
-    if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, bt)) return false;
+    if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, window_size, bt.blocked_mask, blocked_mask)) return false;
+    if (!write_f32_dump(dump_dir, "bt.input", bt.input, {1, seq, 384}, mf)) return false;
+    if (!write_bool_dump(dump_dir, "bt.mask", bt.blocked_mask, {6, seq, seq}, mf)) return false;
+    if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, window_size, bt)) return false;
     for (int i = 0; i < 12; ++i) {
         char boundary[32];
         std::snprintf(boundary, sizeof(boundary), "bt.blk%d.out", i);
-        if (!write_f32_dump(dump_dir, boundary, bt.block_outputs[(size_t) i], {1, 690, 384}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, bt.block_outputs[(size_t) i], {1, seq, 384}, mf)) return false;
     }
-    if (!write_f32_dump(dump_dir, "bt.output", bt.output, {1, 690, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "bt.output", bt.output, {1, seq, 384}, mf)) return false;
     if (!write_f32_dump(dump_dir, "bt.task_language", bt.task_language, {1, 16, 384}, mf)) return false;
-    if (!write_f32_dump(dump_dir, "bt.obs_primary", bt.obs_primary, {1, 2, 256, 384}, mf)) return false;
-    if (!write_f32_dump(dump_dir, "bt.obs_wrist", bt.obs_wrist, {1, 2, 64, 384}, mf)) return false;
-    if (!write_f32_dump(dump_dir, "bt.obs_task_language", bt.obs_task_language, {1, 2, 16, 384}, mf)) return false;
-    if (!write_f32_dump(dump_dir, "bt.readout_action", bt.readout_action, {1, 2, 1, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "bt.obs_primary", bt.obs_primary, {1, window_size, 256, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "bt.obs_wrist", bt.obs_wrist, {1, window_size, 64, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "bt.obs_task_language", bt.obs_task_language, {1, window_size, 16, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "bt.readout_action", bt.readout_action, {1, window_size, 1, 384}, mf)) return false;
 
     OctoDiffusionWeights diffusion_w;
     if (!read_diffusion_weights(g, diffusion_w)) return false;
     OctoDiffusionResult diff;
-    if (!run_diffusion_replay(diffusion_w, case_dir, bt.readout_action, diff)) return false;
-    if (!write_f32_dump(dump_dir, "diff.initial_noise", diff.initial_noise, {1, 2, 28}, mf)) return false;
-    if (!write_bool_dump(dump_dir, "diff.action_mask", diff.action_mask, {1, 2, 4, 7}, mf)) return false;
-    if (!write_bool_dump(dump_dir, "diff.flat_action_mask", diff.flat_action_mask, {1, 2, 28}, mf)) return false;
+    if (!run_diffusion_replay(diffusion_w, case_dir, bt.readout_action, window_size, diff)) return false;
+    if (!write_f32_dump(dump_dir, "diff.initial_noise", diff.initial_noise, {1, window_size, 28}, mf)) return false;
+    if (!write_bool_dump(dump_dir, "diff.action_mask", diff.action_mask, {1, window_size, 4, 7}, mf)) return false;
+    if (!write_bool_dump(dump_dir, "diff.flat_action_mask", diff.flat_action_mask, {1, window_size, 28}, mf)) return false;
     for (int step = 0; step < 20; ++step) {
         char boundary[64];
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.current_x_before", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.current_x_before[(size_t) step], {1, 2, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.current_x_before[(size_t) step], {1, window_size, 28}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.pred_eps", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.pred_eps[(size_t) step], {1, 2, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.pred_eps[(size_t) step], {1, window_size, 28}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.z", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.z[(size_t) step], {1, 2, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.z[(size_t) step], {1, window_size, 28}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_denoise", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.after_denoise[(size_t) step], {1, 2, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.after_denoise[(size_t) step], {1, window_size, 28}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_noise_add", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.after_noise_add[(size_t) step], {1, 2, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.after_noise_add[(size_t) step], {1, window_size, 28}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_clip", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.after_clip[(size_t) step], {1, 2, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.after_clip[(size_t) step], {1, window_size, 28}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_mask", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.after_mask[(size_t) step], {1, 2, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.after_mask[(size_t) step], {1, window_size, 28}, mf)) return false;
     }
-    if (!write_f32_dump(dump_dir, "diff.actions_all_timesteps", diff.actions_all_timesteps, {1, 2, 4, 7}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "diff.actions_all_timesteps", diff.actions_all_timesteps, {1, window_size, 4, 7}, mf)) return false;
     if (!write_f32_dump(dump_dir, "sample_actions.final_action_normalized", diff.final_actions, {1, 4, 7}, mf)) return false;
     if (!write_f32_dump(dump_dir, "action_final", diff.final_actions, {1, 4, 7}, mf)) return false;
 
@@ -2047,6 +2110,12 @@ bool octo_predict_from_images(const std::string& ckpt_path,
                               OctoCliAction& out) {
     gguf_reader g{"octo"};
     if (!g.open(ckpt_path)) return false;
+    const int window_size = (int) g.u32("octo.window_size");
+    if (window_size < 1 || window_size > kMaxHorizon) {
+        std::fprintf(stderr, "vla(octo): octo.window_size=%d out of supported range [1, %d]\n",
+                     window_size, kMaxHorizon);
+        return false;
+    }
 
     std::vector<int32_t> input_ids, attention_mask;
     if (!octo_tokenize_text(ckpt_path, instruction, input_ids, attention_mask)) return false;
@@ -2055,13 +2124,20 @@ bool octo_predict_from_images(const std::string& ckpt_path,
     if (!read_obs_weights(g, "primary", primary_w_g)) return false;
     if (!read_obs_weights(g, "wrist", wrist_w_g)) return false;
 
-    auto build_obs_task = [](const uint8_t * rgb, int sw, int sh, int side, NpyU8& obs, NpyU8& task) {
+    // Cold start: only ONE live frame is available (a single vla-cli snapshot), but the
+    // model expects `window_size` observation timesteps. Repeat the live frame into
+    // every slot; timestep_valid below marks all-but-the-last as padding so the causal
+    // mask (build_transformer_mask) treats only the last slot as "real" -- this matches
+    // OctoPt's HistoryWrapper.reset() cold-start for window_size=2, and generalizes to
+    // window_size=1 (no padding slot at all, the single slot IS the live frame).
+    auto build_obs_task = [window_size](const uint8_t * rgb, int sw, int sh, int side, NpyU8& obs, NpyU8& task) {
         std::vector<uint8_t> frame;
         resize_to_planar_chw(rgb, sw, sh, side, frame);
-        obs.shape = {1, 2, 3, side, side};
-        obs.data.resize((size_t) 2 * 3 * side * side);
-        std::copy(frame.begin(), frame.end(), obs.data.begin());
-        std::copy(frame.begin(), frame.end(), obs.data.begin() + (ptrdiff_t) frame.size());
+        obs.shape = {1, window_size, 3, side, side};
+        obs.data.resize((size_t) window_size * 3 * side * side);
+        for (int t = 0; t < window_size; ++t) {
+            std::copy(frame.begin(), frame.end(), obs.data.begin() + (ptrdiff_t) t * (ptrdiff_t) frame.size());
+        }
         task.shape = {1, 3, side, side};
         task.data.assign((size_t) 3 * side * side, 0);  // no goal image: language-only conditioning
     };
@@ -2070,8 +2146,8 @@ bool octo_predict_from_images(const std::string& ckpt_path,
     build_obs_task(wrist_rgb, wrist_w, wrist_h, 128, wrist_obs, wrist_task);
 
     std::vector<float> tok, primary_proj, primary_pos, wrist_proj, wrist_pos;
-    if (!run_one_obs_tokenizer_graph(primary_w_g, primary_obs, primary_task, 256, 256, tok, primary_proj, primary_pos)) return false;
-    if (!run_one_obs_tokenizer_graph(wrist_w_g, wrist_obs, wrist_task, 128, 64, tok, wrist_proj, wrist_pos)) return false;
+    if (!run_one_obs_tokenizer_graph(primary_w_g, primary_obs, primary_task, 256, 256, window_size, tok, primary_proj, primary_pos)) return false;
+    if (!run_one_obs_tokenizer_graph(wrist_w_g, wrist_obs, wrist_task, 128, 64, window_size, tok, wrist_proj, wrist_pos)) return false;
 
     OctoT5Weights t5_w;
     if (!read_t5_weights(g, t5_w)) return false;
@@ -2084,31 +2160,32 @@ bool octo_predict_from_images(const std::string& ckpt_path,
     t5.shape = {1, 16, 768};
     t5.data = t5_out;
     std::vector<float> lang_proj, lang_pos, repeated;
-    if (!run_language_graph(lang_w, t5, lang_proj, lang_pos, repeated)) return false;
+    if (!run_language_graph(lang_w, t5, window_size, lang_proj, lang_pos, repeated)) return false;
 
     OctoTransformerWeights transformer_w;
     if (!read_transformer_weights(g, transformer_w)) return false;
     NpyBool task_valid, primary_valid, wrist_valid, timestep_valid;
     task_valid.shape = {1};
     task_valid.data = {1};
-    primary_valid.shape = {1, 2};
-    primary_valid.data = {1, 1};
-    wrist_valid.shape = {1, 2};
-    wrist_valid.data = {1, 1};
-    timestep_valid.shape = {1, 2};
-    timestep_valid.data = {0, 1};  // cold start: t=0 is padding, t=1 is the live frame (matches HistoryWrapper.reset)
+    primary_valid.shape = {1, window_size};
+    primary_valid.data.assign((size_t) window_size, 1);
+    wrist_valid.shape = {1, window_size};
+    wrist_valid.data.assign((size_t) window_size, 1);
+    timestep_valid.shape = {1, window_size};
+    timestep_valid.data.assign((size_t) window_size, 0);
+    timestep_valid.data.back() = 1;  // cold start: only the last slot is the live frame (matches HistoryWrapper.reset)
 
     OctoTransformerResult bt;
-    if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, bt.input)) return false;
+    if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, window_size, bt.input)) return false;
     std::vector<float> blocked_mask;
-    if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, bt.blocked_mask, blocked_mask)) return false;
-    if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, bt)) return false;
+    if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, window_size, bt.blocked_mask, blocked_mask)) return false;
+    if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, window_size, bt)) return false;
 
     OctoDiffusionWeights diffusion_w;
     if (!read_diffusion_weights(g, diffusion_w)) return false;
     std::random_device rd;
     std::mt19937 rng(rd());
-    if (!run_diffusion_live(diffusion_w, bt.readout_action, rng, out.normalized)) return false;
+    if (!run_diffusion_live(diffusion_w, bt.readout_action, window_size, rng, out.normalized)) return false;
 
     if (!unnormalize_action(g, "bridge_dataset", out.normalized, out.unnormalized)) return false;
     return true;
@@ -2126,6 +2203,12 @@ bool octo_free_sample_case(const std::string& ckpt_path,
     }
     gguf_reader g{"octo"};
     if (!g.open(ckpt_path)) return false;
+    const int window_size = (int) g.u32("octo.window_size");
+    if (window_size < 1 || window_size > kMaxHorizon) {
+        std::fprintf(stderr, "vla(octo): octo.window_size=%d out of supported range [1, %d]\n",
+                     window_size, kMaxHorizon);
+        return false;
+    }
 
     // Observation: load once from the golden case, exactly as octo_dump_tokenizer_case
     // does (same helpers, same zero-fill fallback for cases with no task image).
@@ -2144,7 +2227,7 @@ bool octo_free_sample_case(const std::string& ckpt_path,
         !parse_npy_bool(case_dir + "/tensors/input.observation.timestep_pad_mask.npy", timestep_valid)) return false;
     std::vector<uint8_t> blocked_bytes;
     std::vector<float> blocked_mask;
-    if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, blocked_bytes, blocked_mask)) return false;
+    if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, window_size, blocked_bytes, blocked_mask)) return false;
 
     // Weights: read once (matches how OctoPt holds a loaded model in memory across
     // repeated sample_actions() calls, rather than reloading per sample).
@@ -2163,13 +2246,14 @@ bool octo_free_sample_case(const std::string& ckpt_path,
     OctoDiffusionWeights diffusion_w;
     if (!read_diffusion_weights(g, diffusion_w)) return false;
 
+    constexpr int action = 28;
     samples_out.assign((size_t) n_samples * 4 * 7, 0.0f);
-    noise_out.assign((size_t) n_samples * 2 * 28, 0.0f);
+    noise_out.assign((size_t) n_samples * (size_t) window_size * action, 0.0f);
 
     for (int i = 0; i < n_samples; ++i) {
         std::vector<float> tok, primary_proj, primary_pos, wrist_proj, wrist_pos;
-        if (!run_one_obs_tokenizer_graph(primary_w_g, primary_obs, primary_task, 256, 256, tok, primary_proj, primary_pos)) return false;
-        if (!run_one_obs_tokenizer_graph(wrist_w_g, wrist_obs, wrist_task, 128, 64, tok, wrist_proj, wrist_pos)) return false;
+        if (!run_one_obs_tokenizer_graph(primary_w_g, primary_obs, primary_task, 256, 256, window_size, tok, primary_proj, primary_pos)) return false;
+        if (!run_one_obs_tokenizer_graph(wrist_w_g, wrist_obs, wrist_task, 128, 64, window_size, tok, wrist_proj, wrist_pos)) return false;
 
         OctoT5Weights t5_w = t5_w_master;
         std::vector<float> t5_out;
@@ -2179,18 +2263,18 @@ bool octo_free_sample_case(const std::string& ckpt_path,
         t5.shape = {1, 16, 768};
         t5.data = t5_out;
         std::vector<float> lang_proj, lang_pos, repeated;
-        if (!run_language_graph(lang_w, t5, lang_proj, lang_pos, repeated)) return false;
+        if (!run_language_graph(lang_w, t5, window_size, lang_proj, lang_pos, repeated)) return false;
 
         OctoTransformerWeights transformer_w = transformer_w_master;
         OctoTransformerResult bt;
-        if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, bt.input)) return false;
-        if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, bt)) return false;
+        if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, repeated, transformer_w.readout_pos, window_size, bt.input)) return false;
+        if (!run_transformer_graph(transformer_w, bt.input, blocked_mask, window_size, bt)) return false;
 
         std::mt19937 rng(seed + (uint32_t) i);
         std::vector<float> sample, noise;
-        if (!run_diffusion_live(diffusion_w, bt.readout_action, rng, sample, &noise)) return false;
+        if (!run_diffusion_live(diffusion_w, bt.readout_action, window_size, rng, sample, &noise)) return false;
         std::copy(sample.begin(), sample.end(), samples_out.begin() + (size_t) i * 28);
-        std::copy(noise.begin(), noise.end(), noise_out.begin() + (size_t) i * 56);
+        std::copy(noise.begin(), noise.end(), noise_out.begin() + (size_t) i * (size_t) window_size * action);
     }
     return true;
 }
