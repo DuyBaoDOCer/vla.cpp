@@ -26,11 +26,14 @@ FetchContent_Declare(llama
 FetchContent_MakeAvailable(llama)
 
 # T5 SentencePiece tokenizer (Octo language instructions). Static, self-contained
-# (vendors its own abseil/protobuf-lite subset under third_party/) -- no shared
-# lib, no test binaries, no tcmalloc.
-set(SPM_ENABLE_SHARED   OFF CACHE BOOL "" FORCE)
-set(SPM_BUILD_TEST      OFF CACHE BOOL "" FORCE)
-set(SPM_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
+# -- no shared lib, no test binaries, no tcmalloc. Uses the SYSTEM protobuf
+# (not sentencepiece's vendored protobuf-lite 3.14) so it shares one protobuf
+# runtime with the server's own .pb.cc code (system protobuf) -- vla-server
+# aborts at static-init if two protobuf versions end up in the same binary.
+set(SPM_ENABLE_SHARED    OFF     CACHE BOOL   "" FORCE)
+set(SPM_BUILD_TEST       OFF     CACHE BOOL   "" FORCE)
+set(SPM_ENABLE_TCMALLOC  OFF     CACHE BOOL   "" FORCE)
+set(SPM_PROTOBUF_PROVIDER "package" CACHE STRING "" FORCE)
 FetchContent_Declare(sentencepiece
     GIT_REPOSITORY https://github.com/google/sentencepiece
     GIT_TAG        v0.2.0
