@@ -51,6 +51,7 @@ int main(int argc, char ** argv) {
     std::string dump_dir;
     std::string t5_inject_path;
     std::string unnorm_dataset = "bridge_dataset";
+    bool resident = false;  // TIP-BUILD-OCTO-GPU-B: opt-in GPU-wired dump path
     int free_sample_n = 0;
     uint32_t seed = 0;
     std::string out_samples_path = "cpp_samples.npy";
@@ -100,6 +101,8 @@ int main(int argc, char ** argv) {
             const char * v = need("--out-noise");
             if (!v) return 1;
             out_noise_path = v;
+        } else if (a == "--resident") {
+            resident = true;
         } else {
             std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
             return 1;
@@ -130,12 +133,18 @@ int main(int argc, char ** argv) {
     if (ckpt.empty() || case_dir.empty() || dump_dir.empty()) {
         std::fprintf(stderr,
             "usage: %s --ckpt octo-small-1.5-f32.gguf --case <golden-case-dir> [--t5-inject <npy>]\n"
-            "          [--unnorm-dataset <key>] [--out <dump-dir>|VLA_OCTO_DUMP=<dump-dir>]\n"
+            "          [--unnorm-dataset <key>] [--out <dump-dir>|VLA_OCTO_DUMP=<dump-dir>] [--resident]\n"
             "       %s --ckpt <gguf> --case <dir> --free-sample N [--seed S]\n"
-            "          [--out-samples <npy>] [--out-noise <npy>]\n", argv[0], argv[0]);
+            "          [--out-samples <npy>] [--out-noise <npy>]\n"
+            "  --resident  compute via the resident/GPU-wired path (TIP-BUILD-OCTO-GPU-B) --\n"
+            "              same code OctoModelArch::predict() runs, instead of the default\n"
+            "              CPU-only host-vector dump path.\n", argv[0], argv[0]);
         return 1;
     }
-    if (!vla::octo_dump_tokenizer_case(ckpt, case_dir, dump_dir, t5_inject_path, unnorm_dataset)) return 2;
-    std::printf("octo_parity_dump wrote %s\n", dump_dir.c_str());
+    const bool ok = resident
+        ? vla::octo_dump_tokenizer_case_resident(ckpt, case_dir, dump_dir, t5_inject_path, unnorm_dataset)
+        : vla::octo_dump_tokenizer_case(ckpt, case_dir, dump_dir, t5_inject_path, unnorm_dataset);
+    if (!ok) return 2;
+    std::printf("octo_parity_dump wrote %s%s\n", dump_dir.c_str(), resident ? " (resident/GPU path)" : "");
     return 0;
 }

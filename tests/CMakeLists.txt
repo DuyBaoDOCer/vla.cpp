@@ -7,6 +7,11 @@ add_executable(vla_predict_check predict_check.cpp)
 target_link_libraries(vla_predict_check PRIVATE vla_core)
 target_compile_options(vla_predict_check PRIVATE -Wall -Wextra)
 
+add_executable(octo_bench octo_bench.cpp)
+target_include_directories(octo_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(octo_bench PRIVATE vla_core)
+target_compile_options(octo_bench PRIVATE -Wall -Wextra)
+
 add_executable(octo_load_check octo_load_check.cpp)
 target_include_directories(octo_load_check PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(octo_load_check PRIVATE vla_core)

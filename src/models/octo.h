@@ -17,6 +17,18 @@ bool octo_dump_tokenizer_case(const std::string& ckpt_path,
                               const std::string& t5_inject_path = "",
                               const std::string& unnorm_dataset = "bridge_dataset");
 
+// TIP-BUILD-OCTO-GPU-B: identical boundary set/layout to octo_dump_tokenizer_case, but
+// computed via the resident/GPU-wired *_resident functions on the model's real backend (CUDA
+// when available) instead of the CPU-only host-vector path -- the literal code
+// OctoModelArch::predict() runs, exercised through the same golden-comparison dump format so
+// verify_octo_parity.py can measure real GPU-vs-CPU-golden drift per boundary. Opt-in via
+// octo_parity_dump's --resident flag; the CPU dump path above is unchanged and remains default.
+bool octo_dump_tokenizer_case_resident(const std::string& ckpt_path,
+                                       const std::string& case_dir,
+                                       const std::string& dump_dir,
+                                       const std::string& t5_inject_path = "",
+                                       const std::string& unnorm_dataset = "bridge_dataset");
+
 // T5 SentencePiece-unigram tokenization (vocab embedded in the GGUF at convert
 // time). Pads/truncates to octo.tokens.language (16), appends EOS, matching
 // HFTokenizer(t5-base, max_length=16, padding="max_length", truncation=True).
