@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -3284,11 +3285,18 @@ static bool octo_run_pipeline_resident(ggml_context * ctx_w, ggml_backend_t back
                                        const std::vector<int32_t>& attention_mask,
                                        const std::string& unnorm_dataset,
                                        std::vector<float>& normalized_out,
-                                       std::vector<float>& unnormalized_out) {
+                                       std::vector<float>& unnormalized_out,
+                                       float& ms_vision_out,
+                                       float& ms_inference_out) {
+    using clock = std::chrono::steady_clock;
+
+    const auto t_vision0 = clock::now();
     std::vector<float> tok, primary_proj, primary_pos, wrist_proj, wrist_pos;
     if (!run_one_obs_tokenizer_graph_resident(ctx_w, backend, "primary", primary_obs, primary_task, 256, 256, window_size, tok, primary_proj, primary_pos)) return false;
     if (!run_one_obs_tokenizer_graph_resident(ctx_w, backend, "wrist", wrist_obs, wrist_task, 128, 64, window_size, tok, wrist_proj, wrist_pos)) return false;
+    ms_vision_out = std::chrono::duration<float, std::milli>(clock::now() - t_vision0).count();
 
+    const auto t_inference0 = clock::now();
     std::vector<float> t5_out;
     if (!run_t5_encoder_graph_resident(ctx_w, backend, input_ids, attention_mask, t5_out)) return false;
 
@@ -3322,6 +3330,7 @@ static bool octo_run_pipeline_resident(ggml_context * ctx_w, ggml_backend_t back
     std::random_device rd;
     std::mt19937 rng(rd());
     if (!run_diffusion_live_resident(ctx_w, backend, bt.readout_action, window_size, rng, normalized_out)) return false;
+    ms_inference_out = std::chrono::duration<float, std::milli>(clock::now() - t_inference0).count();
 
     return unnormalize_action(io, unnorm_dataset, normalized_out, unnormalized_out);
 }
@@ -3386,6 +3395,7 @@ bool octo_predict_from_images(const std::string& ckpt_path,
 // full rationale; the client (adapters.py) only needs to invert+binarize the gripper dim,
 // not repeat the mean/std un-normalization.
 std::vector<float> OctoModelArch::predict(const Inputs& in) {
+    const auto t_total0 = std::chrono::steady_clock::now();
     if (in.n_images < 1 || !in.images) {
         std::fprintf(stderr, "vla(octo): predict needs at least 1 image (primary)\n");
         return {};
@@ -3434,11 +3444,16 @@ std::vector<float> OctoModelArch::predict(const Inputs& in) {
     const std::vector<int32_t> attention_mask(in.attention_mask, in.attention_mask + in.attention_mask_n);
 
     std::vector<float> normalized, unnormalized;
+    float ms_vision = 0.f, ms_inference = 0.f;
     if (!octo_run_pipeline_resident(ctx_weights, backend, io, (int) window_size, primary_obs, primary_task, wrist_obs, wrist_task,
                                     wrist_real, input_ids, attention_mask, /*unnorm_dataset=*/"",
-                                    normalized, unnormalized)) {
+                                    normalized, unnormalized, ms_vision, ms_inference)) {
         return {};
     }
+    stats.ms_vision = ms_vision;
+    stats.ms_inference = ms_inference;
+    stats.ms_total = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - t_total0).count();
     return unnormalized;
 }
 
