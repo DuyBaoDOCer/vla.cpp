@@ -28,37 +28,70 @@ target_compile_options(octo_parity_dump PRIVATE -Wall -Wextra)
 # to audit if a future golden case uses a different dataset.
 set(OCTO_UNNORM_DATASET bridge_dataset)
 
+# TIP-ND1-A: registers the standard (disk-read) ctest case AND a parallel "${NAME}_resident"
+# variant that runs the exact same dumper/case/golden/tolerances but with RESIDENT=1 (adds
+# --resident to the octo_parity_dump invocation -- see run_octo_parity.cmake), so ctest
+# auto-verifies the resident (m->backend) dump path against the same golden the original
+# already passes, without touching or replacing the original test. Resident dumps go to a
+# sibling "<dump-dir>_resident" directory so both variants can run without clobbering each
+# other's parity_report.json.
+function(add_octo_parity_test)
+  set(oneValueArgs NAME CKPT CASE_DIR T5_INJECT TRANSFORMER_TOL UNNORM_DATASET KNOWN_MISMATCH EXCLUDE DUMP_DIR)
+  cmake_parse_arguments(APT "" "${oneValueArgs}" "" ${ARGN})
+  add_test(
+    NAME ${APT_NAME}
+    COMMAND ${CMAKE_COMMAND}
+      -DCKPT=${APT_CKPT}
+      -DCASE_DIR=${APT_CASE_DIR}
+      -DT5_INJECT=${APT_T5_INJECT}
+      -DTRANSFORMER_TOL=${APT_TRANSFORMER_TOL}
+      -DUNNORM_DATASET=${APT_UNNORM_DATASET}
+      -DKNOWN_MISMATCH=${APT_KNOWN_MISMATCH}
+      -DEXCLUDE=${APT_EXCLUDE}
+      -DDUMP_DIR=${APT_DUMP_DIR}
+      -DDUMPER=$<TARGET_FILE:octo_parity_dump>
+      -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
+      -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
+  add_test(
+    NAME ${APT_NAME}_resident
+    COMMAND ${CMAKE_COMMAND}
+      -DCKPT=${APT_CKPT}
+      -DCASE_DIR=${APT_CASE_DIR}
+      -DT5_INJECT=${APT_T5_INJECT}
+      -DTRANSFORMER_TOL=${APT_TRANSFORMER_TOL}
+      -DUNNORM_DATASET=${APT_UNNORM_DATASET}
+      -DKNOWN_MISMATCH=${APT_KNOWN_MISMATCH}
+      -DEXCLUDE=${APT_EXCLUDE}
+      -DDUMP_DIR=${APT_DUMP_DIR}_resident
+      -DRESIDENT=1
+      -DDUMPER=$<TARGET_FILE:octo_parity_dump>
+      -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
+      -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
+endfunction()
+
 if(Python3_FOUND AND DEFINED ENV{VLA_OCTO_GOLDEN_DIR})
   foreach(OCTO_PARITY_CASE example_batch synthetic_zero synthetic_random second_timestep_padded wrist_valid_synthetic synthetic_ramp)
     if(EXISTS "$ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy")
       # Oracle mode: --t5-inject feeds the golden tokens downstream; native T5 output is still
       # dumped as "t5.out" and checked against golden independently (M5, TIP-006).
-      add_test(
+      add_octo_parity_test(
         NAME octo_parity_${OCTO_PARITY_CASE}
-        COMMAND ${CMAKE_COMMAND}
-          -DCKPT=${CMAKE_SOURCE_DIR}/octo-small-1.5-f32.gguf
-          -DCASE_DIR=$ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}
-          -DT5_INJECT=$ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy
-          -DTRANSFORMER_TOL=2e-3
-          -DUNNORM_DATASET=${OCTO_UNNORM_DATASET}
-          -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity/${OCTO_PARITY_CASE}
-          -DDUMPER=$<TARGET_FILE:octo_parity_dump>
-          -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
-          -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
-          -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
+        CKPT ${CMAKE_SOURCE_DIR}/octo-small-1.5-f32.gguf
+        CASE_DIR $ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}
+        T5_INJECT $ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy
+        TRANSFORMER_TOL 2e-3
+        UNNORM_DATASET ${OCTO_UNNORM_DATASET}
+        DUMP_DIR ${CMAKE_BINARY_DIR}/octo_parity/${OCTO_PARITY_CASE})
       # Native mode: no --t5-inject, T5-base encoder output drives the whole pipeline end-to-end.
-      add_test(
+      add_octo_parity_test(
         NAME octo_parity_native_${OCTO_PARITY_CASE}
-        COMMAND ${CMAKE_COMMAND}
-          -DCKPT=${CMAKE_SOURCE_DIR}/octo-small-1.5-f32.gguf
-          -DCASE_DIR=$ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}
-          -DTRANSFORMER_TOL=2e-3
-          -DUNNORM_DATASET=${OCTO_UNNORM_DATASET}
-          -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity_native/${OCTO_PARITY_CASE}
-          -DDUMPER=$<TARGET_FILE:octo_parity_dump>
-          -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
-          -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
-          -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
+        CKPT ${CMAKE_SOURCE_DIR}/octo-small-1.5-f32.gguf
+        CASE_DIR $ENV{VLA_OCTO_GOLDEN_DIR}/${OCTO_PARITY_CASE}
+        TRANSFORMER_TOL 2e-3
+        UNNORM_DATASET ${OCTO_UNNORM_DATASET}
+        DUMP_DIR ${CMAKE_BINARY_DIR}/octo_parity_native/${OCTO_PARITY_CASE})
     endif()
   endforeach()
 endif()
@@ -81,33 +114,23 @@ if(Python3_FOUND AND DEFINED ENV{VLA_OCTO_GOLDEN_DIR_TIER2})
   set(OCTO_BRIDGE_DEBUG_KNOWN_MISMATCH
     "action_final_unnormalized:bridge_debug's golden dataset_statistics differs numerically from the checkpoint's embedded bridge_dataset stats (see TIP-008 report); unnormalize formula itself is verified correct")
   if(EXISTS "${OCTO_BRIDGE_DEBUG_DIR}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy")
-    add_test(
+    add_octo_parity_test(
       NAME octo_parity_bridge_debug
-      COMMAND ${CMAKE_COMMAND}
-        -DCKPT=${CMAKE_SOURCE_DIR}/octo-small-1.5-f32.gguf
-        -DCASE_DIR=${OCTO_BRIDGE_DEBUG_DIR}
-        -DT5_INJECT=${OCTO_BRIDGE_DEBUG_DIR}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy
-        -DTRANSFORMER_TOL=2e-3
-        -DUNNORM_DATASET=${OCTO_UNNORM_DATASET}
-        -DKNOWN_MISMATCH=${OCTO_BRIDGE_DEBUG_KNOWN_MISMATCH}
-        -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity/bridge_debug
-        -DDUMPER=$<TARGET_FILE:octo_parity_dump>
-        -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
-        -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
-        -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
-    add_test(
+      CKPT ${CMAKE_SOURCE_DIR}/octo-small-1.5-f32.gguf
+      CASE_DIR ${OCTO_BRIDGE_DEBUG_DIR}
+      T5_INJECT ${OCTO_BRIDGE_DEBUG_DIR}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy
+      TRANSFORMER_TOL 2e-3
+      UNNORM_DATASET ${OCTO_UNNORM_DATASET}
+      KNOWN_MISMATCH ${OCTO_BRIDGE_DEBUG_KNOWN_MISMATCH}
+      DUMP_DIR ${CMAKE_BINARY_DIR}/octo_parity/bridge_debug)
+    add_octo_parity_test(
       NAME octo_parity_native_bridge_debug
-      COMMAND ${CMAKE_COMMAND}
-        -DCKPT=${CMAKE_SOURCE_DIR}/octo-small-1.5-f32.gguf
-        -DCASE_DIR=${OCTO_BRIDGE_DEBUG_DIR}
-        -DTRANSFORMER_TOL=2e-3
-        -DUNNORM_DATASET=${OCTO_UNNORM_DATASET}
-        -DKNOWN_MISMATCH=${OCTO_BRIDGE_DEBUG_KNOWN_MISMATCH}
-        -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity_native/bridge_debug
-        -DDUMPER=$<TARGET_FILE:octo_parity_dump>
-        -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
-        -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
-        -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
+      CKPT ${CMAKE_SOURCE_DIR}/octo-small-1.5-f32.gguf
+      CASE_DIR ${OCTO_BRIDGE_DEBUG_DIR}
+      TRANSFORMER_TOL 2e-3
+      UNNORM_DATASET ${OCTO_UNNORM_DATASET}
+      KNOWN_MISMATCH ${OCTO_BRIDGE_DEBUG_KNOWN_MISMATCH}
+      DUMP_DIR ${CMAKE_BINARY_DIR}/octo_parity_native/bridge_debug)
   endif()
 endif()
 
@@ -133,34 +156,24 @@ if(Python3_FOUND AND DEFINED ENV{VLA_OCTO_LIBERO_GOLDEN_DIR} AND DEFINED ENV{VLA
     if(EXISTS "$ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy")
       # Oracle mode: --t5-inject feeds the golden tokens downstream; native T5 output is still
       # dumped as "t5.out" and checked against golden independently.
-      add_test(
+      add_octo_parity_test(
         NAME octo_parity_libero_${OCTO_LIBERO_CASE}
-        COMMAND ${CMAKE_COMMAND}
-          -DCKPT=$ENV{VLA_OCTO_LIBERO_CKPT}
-          -DCASE_DIR=$ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}
-          -DT5_INJECT=$ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy
-          -DTRANSFORMER_TOL=2e-3
-          -DUNNORM_DATASET=${OCTO_LIBERO_UNNORM_DATASET}
-          -DEXCLUDE=${OCTO_LIBERO_EXCLUDE}
-          -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity_libero/${OCTO_LIBERO_CASE}
-          -DDUMPER=$<TARGET_FILE:octo_parity_dump>
-          -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
-          -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
-          -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
+        CKPT $ENV{VLA_OCTO_LIBERO_CKPT}
+        CASE_DIR $ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}
+        T5_INJECT $ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}/tensors/octo_transformer.task_language.tokens_after_tokenizer.npy
+        TRANSFORMER_TOL 2e-3
+        UNNORM_DATASET ${OCTO_LIBERO_UNNORM_DATASET}
+        EXCLUDE ${OCTO_LIBERO_EXCLUDE}
+        DUMP_DIR ${CMAKE_BINARY_DIR}/octo_parity_libero/${OCTO_LIBERO_CASE})
       # Native mode: no --t5-inject, T5-base encoder output drives the whole pipeline end-to-end.
-      add_test(
+      add_octo_parity_test(
         NAME octo_parity_libero_native_${OCTO_LIBERO_CASE}
-        COMMAND ${CMAKE_COMMAND}
-          -DCKPT=$ENV{VLA_OCTO_LIBERO_CKPT}
-          -DCASE_DIR=$ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}
-          -DTRANSFORMER_TOL=2e-3
-          -DUNNORM_DATASET=${OCTO_LIBERO_UNNORM_DATASET}
-          -DEXCLUDE=${OCTO_LIBERO_EXCLUDE}
-          -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_parity_libero_native/${OCTO_LIBERO_CASE}
-          -DDUMPER=$<TARGET_FILE:octo_parity_dump>
-          -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
-          -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
-          -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
+        CKPT $ENV{VLA_OCTO_LIBERO_CKPT}
+        CASE_DIR $ENV{VLA_OCTO_LIBERO_GOLDEN_DIR}/${OCTO_LIBERO_CASE}
+        TRANSFORMER_TOL 2e-3
+        UNNORM_DATASET ${OCTO_LIBERO_UNNORM_DATASET}
+        EXCLUDE ${OCTO_LIBERO_EXCLUDE}
+        DUMP_DIR ${CMAKE_BINARY_DIR}/octo_parity_libero_native/${OCTO_LIBERO_CASE})
     endif()
   endforeach()
 endif()

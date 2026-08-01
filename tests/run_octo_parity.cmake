@@ -30,8 +30,17 @@ if(DEFINED EXCLUDE AND NOT "${EXCLUDE}" STREQUAL "")
   list(APPEND EXCLUDE_ARGS --exclude "${EXCLUDE}")
 endif()
 
+# TIP-ND1-A: RESIDENT=1 makes the dumper compute via the resident/GPU-wired path
+# (octo_dump_tokenizer_case_resident, --resident) instead of the default disk-read path,
+# against the same golden and same tolerances -- so a resident variant can be registered
+# alongside the original ctest case without any octo.cpp change.
+set(RESIDENT_ARGS "")
+if(DEFINED RESIDENT AND RESIDENT)
+  list(APPEND RESIDENT_ARGS --resident)
+endif()
+
 execute_process(
-  COMMAND "${DUMPER}" --ckpt "${CKPT}" --case "${CASE_DIR}" ${T5_ARGS} ${UNNORM_DATASET_ARGS} --out "${DUMP_DIR}"
+  COMMAND "${DUMPER}" --ckpt "${CKPT}" --case "${CASE_DIR}" ${T5_ARGS} ${UNNORM_DATASET_ARGS} ${RESIDENT_ARGS} --out "${DUMP_DIR}"
   RESULT_VARIABLE dump_rc
 )
 if(NOT dump_rc EQUAL 0)
