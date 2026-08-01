@@ -28,13 +28,11 @@ target_compile_options(octo_parity_dump PRIVATE -Wall -Wextra)
 # to audit if a future golden case uses a different dataset.
 set(OCTO_UNNORM_DATASET bridge_dataset)
 
-# TIP-ND1-A: registers the standard (disk-read) ctest case AND a parallel "${NAME}_resident"
-# variant that runs the exact same dumper/case/golden/tolerances but with RESIDENT=1 (adds
-# --resident to the octo_parity_dump invocation -- see run_octo_parity.cmake), so ctest
-# auto-verifies the resident (m->backend) dump path against the same golden the original
-# already passes, without touching or replacing the original test. Resident dumps go to a
-# sibling "<dump-dir>_resident" directory so both variants can run without clobbering each
-# other's parity_report.json.
+# TIP-ND1-B: registers one ctest case running octo_parity_dump (now resident-only -- the
+# gốc/"_resident" split this helper used to register in parallel, TIP-ND1-A, was collapsed
+# back to one test per case once TIP-ND1-A proved resident-on-CPU is bit-exact with the
+# now-deleted gốc path and octo.cpp was unified onto it, TIP-ND1-B). Test names are unchanged
+# from before TIP-ND1-A.
 function(add_octo_parity_test)
   set(oneValueArgs NAME CKPT CASE_DIR T5_INJECT TRANSFORMER_TOL UNNORM_DATASET KNOWN_MISMATCH EXCLUDE DUMP_DIR)
   cmake_parse_arguments(APT "" "${oneValueArgs}" "" ${ARGN})
@@ -49,22 +47,6 @@ function(add_octo_parity_test)
       -DKNOWN_MISMATCH=${APT_KNOWN_MISMATCH}
       -DEXCLUDE=${APT_EXCLUDE}
       -DDUMP_DIR=${APT_DUMP_DIR}
-      -DDUMPER=$<TARGET_FILE:octo_parity_dump>
-      -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
-      -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_octo_parity.cmake)
-  add_test(
-    NAME ${APT_NAME}_resident
-    COMMAND ${CMAKE_COMMAND}
-      -DCKPT=${APT_CKPT}
-      -DCASE_DIR=${APT_CASE_DIR}
-      -DT5_INJECT=${APT_T5_INJECT}
-      -DTRANSFORMER_TOL=${APT_TRANSFORMER_TOL}
-      -DUNNORM_DATASET=${APT_UNNORM_DATASET}
-      -DKNOWN_MISMATCH=${APT_KNOWN_MISMATCH}
-      -DEXCLUDE=${APT_EXCLUDE}
-      -DDUMP_DIR=${APT_DUMP_DIR}_resident
-      -DRESIDENT=1
       -DDUMPER=$<TARGET_FILE:octo_parity_dump>
       -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_parity.py
       -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}

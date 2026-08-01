@@ -5,8 +5,8 @@
 // Permanent tripwire for Octo's final-action-slice formula, the single riskiest line in the
 // window-size port (Blueprint risk item 1445/1492): OctoPt's sample_actions() returns
 // actions[:, -1] -- the LAST timestep of the observation window -- after the diffusion head
-// runs over the full window. src/models/octo.cpp (run_diffusion_replay /
-// run_diffusion_live_sample, both around the "final action slice" comment) implements this as:
+// runs over the full window. src/models/octo.cpp (run_diffusion_resident, around the "final
+// action slice" comment) implements this as:
 //
 //     final_begin = (window_size - 1) * action;
 //     final_end   = window_size * action;

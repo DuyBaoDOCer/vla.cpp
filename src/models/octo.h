@@ -11,18 +11,13 @@
 namespace vla {
 
 bool octo_dump_gguf_inventory(const std::string& ckpt_path);
-bool octo_dump_tokenizer_case(const std::string& ckpt_path,
-                              const std::string& case_dir,
-                              const std::string& dump_dir,
-                              const std::string& t5_inject_path = "",
-                              const std::string& unnorm_dataset = "bridge_dataset");
 
-// TIP-BUILD-OCTO-GPU-B: identical boundary set/layout to octo_dump_tokenizer_case, but
-// computed via the resident/GPU-wired *_resident functions on the model's real backend (CUDA
-// when available) instead of the CPU-only host-vector path -- the literal code
-// OctoModelArch::predict() runs, exercised through the same golden-comparison dump format so
-// verify_octo_parity.py can measure real GPU-vs-CPU-golden drift per boundary. Opt-in via
-// octo_parity_dump's --resident flag; the CPU dump path above is unchanged and remains default.
+// TIP-ND1-B: sole tokenizer-case dump path (was octo_dump_tokenizer_case / _resident before
+// TIP-ND1-A proved the resident/GPU-wired path is bit-exact with the deleted disk-read
+// original -- 20/20 golden cases). Dumps every M0-M8 boundary needed by
+// verify_octo_parity.py, computed via the resident stage functions on the model's real
+// backend (CUDA when available, CPU otherwise) -- the literal code OctoModelArch::predict()
+// runs.
 bool octo_dump_tokenizer_case_resident(const std::string& ckpt_path,
                                        const std::string& case_dir,
                                        const std::string& dump_dir,
