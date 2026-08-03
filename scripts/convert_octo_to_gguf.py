@@ -32,8 +32,9 @@ OCTO_META: dict[str, Any] = {
     "attention.head_count": 6,
     "feed_forward_length": 1536,
     "attention.layer_norm_eps": 1e-6,
-    "action.horizon": 4,
-    "action.dim": 7,
+    # action.horizon / action.dim / action.head_type are set from the checkpoint's own
+    # config (model.config["model"]["heads"]["action"]) in main() -- they differ between
+    # the diffusion libero checkpoints (horizon=4) and L1 pytorch checkpoints (horizon=20).
     "readout.count": 1,
     "tokens.primary": 256,
     "tokens.wrist": 64,
@@ -47,6 +48,15 @@ OCTO_META: dict[str, Any] = {
     "diffusion.time_dim": 32,
     "diffusion.hidden": 256,
     "diffusion.num_blocks": 3,
+}
+
+# octo.action.head_type values, keyed by the PyTorch action-head class name recorded in
+# a checkpoint's own config.json (model.config["model"]["heads"]["action"]["name"]).
+HEAD_TYPE_BY_CLASS: dict[str, str] = {
+    "L1ActionHeadPt": "l1",
+    "MSEActionHeadPt": "mse",
+    "DiffusionActionHeadPt": "diffusion",
+    "UNetDDPMActionHeadPt": "diffusion",
 }
 
 IGNORED_PATTERNS = (
@@ -122,14 +132,20 @@ def map_key(pt_key: str) -> str | None:
         view, leaf = m.groups()
         return f"octo.obs.{view}.patch_embd.{leaf}"
 
-    m = re.fullmatch(r"octo_transformer\.obs_projections\.obs_(primary|wrist)_projection\.(weight|bias)", k)
+    m = re.fullmatch(r"octo_transformer\.obs_projections\.obs_(primary|wrist|proprio)_projection\.(weight|bias)", k)
     if m:
         view, leaf = m.groups()
         return f"octo.obs.{view}.proj.{leaf}"
 
-    m = re.fullmatch(r"octo_transformer\.obs_(primary|wrist)_pos_embedding", k)
+    m = re.fullmatch(r"octo_transformer\.obs_(primary|wrist|proprio)_pos_embedding", k)
     if m:
         return f"octo.obs.{m.group(1)}.pos_embd"
+
+    # LowdimObsTokenizerPt (proprio): fixed, non-trainable bin edges for the BinTokenizer
+    # quantization -- not a learned weight, but still needed by the engine to reproduce
+    # the same binning at inference time.
+    if k == "octo_transformer.observation_tokenizers.proprio.thresholds":
+        return "octo.obs.proprio.bin_thresholds"
 
     m = re.fullmatch(r"octo_transformer\.task_projections\.task_language_projection\.(weight|bias)", k)
     if m:
@@ -160,6 +176,29 @@ def map_key(pt_key: str) -> str | None:
     m = re.fullmatch(r"octo_transformer\.block_transformer\.transformer\.layer_norm\.(weight|bias)", k)
     if m:
         return f"octo.output_norm.{m.group(1)}"
+
+    p = "heads.action.map_head."
+    if k == p + "probe":
+        return "octo.head.l1.map.probe"
+    m = re.fullmatch(re.escape(p) + r"attention\.(in_proj_weight|in_proj_bias)", k)
+    if m:
+        leaf = "weight" if m.group(1) == "in_proj_weight" else "bias"
+        return f"octo.head.l1.map.attn_qkv.{leaf}"
+    m = re.fullmatch(re.escape(p) + r"attention\.out_proj\.(weight|bias)", k)
+    if m:
+        return f"octo.head.l1.map.attn_o.{m.group(1)}"
+    m = re.fullmatch(re.escape(p) + r"layer_norm\.(weight|bias)", k)
+    if m:
+        return f"octo.head.l1.map.norm.{m.group(1)}"
+    m = re.fullmatch(re.escape(p) + r"mlp_block\.dense1\.(weight|bias)", k)
+    if m:
+        return f"octo.head.l1.map.ffn_up.{m.group(1)}"
+    m = re.fullmatch(re.escape(p) + r"mlp_block\.dense2\.(weight|bias)", k)
+    if m:
+        return f"octo.head.l1.map.ffn_down.{m.group(1)}"
+    m = re.fullmatch(r"heads\.action\.mean_proj\.(weight|bias)", k)
+    if m:
+        return f"octo.head.l1.mean_proj.{m.group(1)}"
 
     p = "heads.action.diffusion_model."
     if k == p + "time_preprocess.w":
@@ -271,7 +310,39 @@ def _resolve_window_size(model: Any, ckpt_arg: str | None, ckpt_path: str,
     )
 
 
-def _validate_required(mapped: dict[str, str]) -> list[str]:
+def _head_type_from_class(head_class_name: str) -> str:
+    try:
+        return HEAD_TYPE_BY_CLASS[head_class_name]
+    except KeyError:
+        raise SystemExit(
+            f"unrecognized action head class {head_class_name!r}; add it to "
+            "HEAD_TYPE_BY_CLASS with its octo.action.head_type value"
+        )
+
+
+def _detect_ckpt_format(ckpt_arg: str | None, step: int | None) -> str:
+    """Auto-detect checkpoint format for --ckpt-format=auto.
+
+    PyTorch checkpoints saved via OctoModelPt.save_pretrained() lay out
+    <ckpt>/config.json, <ckpt>/dataset_statistics.json, <ckpt>/<step>/weights.pth.
+    JAX/Orbax checkpoints (the only kind load_pretrained_from_jax reads) never
+    have a weights.pth. hf:// ids and the default MODEL_ID (rail-berkeley bridge
+    pretrain) are always jax.
+    """
+    if ckpt_arg is None or ckpt_arg.startswith("hf://"):
+        return "jax"
+    ckpt_path = Path(ckpt_arg)
+    if not ckpt_path.is_dir():
+        return "jax"
+    if step is not None:
+        return "pytorch" if (ckpt_path / str(step) / "weights.pth").exists() else "jax"
+    for sub in ckpt_path.iterdir():
+        if sub.is_dir() and sub.name.isdigit() and (sub / "weights.pth").exists():
+            return "pytorch"
+    return "jax"
+
+
+def _validate_required(mapped: dict[str, str], head_type: str, has_proprio: bool) -> list[str]:
     required: list[str] = []
     for view in ("primary", "wrist"):
         for i in range(4):
@@ -282,22 +353,41 @@ def _validate_required(mapped: dict[str, str]) -> list[str]:
             required.append(f"octo.obs.{view}.patch_embd.{leaf}")
             required.append(f"octo.obs.{view}.proj.{leaf}")
         required.append(f"octo.obs.{view}.pos_embd")
+    if has_proprio:
+        # LowdimObsTokenizerPt has no conv stem/patch_embd (it's a BinTokenizer, not an
+        # image encoder) -- only a projection, a pos embedding, and the bin thresholds.
+        for leaf in ("weight", "bias"):
+            required.append(f"octo.obs.proprio.proj.{leaf}")
+        required.append("octo.obs.proprio.pos_embd")
+        required.append("octo.obs.proprio.bin_thresholds")
     required += ["octo.task.language.proj.weight", "octo.task.language.proj.bias", "octo.task.language.pos_embd", "octo.readout.action.pos_embd"]
     for i in range(12):
         for stem in ("attn_norm", "attn_qkv", "attn_o", "ffn_norm", "ffn_up", "ffn_down"):
             for leaf in ("weight", "bias"):
                 required.append(f"octo.blk.{i}.{stem}.{leaf}")
-    required += ["octo.head.diffusion.time_fourier.weight"]
-    for i in range(2):
-        for leaf in ("weight", "bias"):
-            required.append(f"octo.head.diffusion.cond.{i}.{leaf}")
-    for leaf in ("weight", "bias"):
-        required.append(f"octo.head.diffusion.reverse.in.{leaf}")
-        required.append(f"octo.head.diffusion.reverse.out.{leaf}")
-    for i in range(3):
-        for sub in ("ln", "fc1", "fc2"):
+    if head_type == "diffusion":
+        required += ["octo.head.diffusion.time_fourier.weight"]
+        for i in range(2):
             for leaf in ("weight", "bias"):
-                required.append(f"octo.head.diffusion.reverse.blk.{i}.{sub}.{leaf}")
+                required.append(f"octo.head.diffusion.cond.{i}.{leaf}")
+        for leaf in ("weight", "bias"):
+            required.append(f"octo.head.diffusion.reverse.in.{leaf}")
+            required.append(f"octo.head.diffusion.reverse.out.{leaf}")
+        for i in range(3):
+            for sub in ("ln", "fc1", "fc2"):
+                for leaf in ("weight", "bias"):
+                    required.append(f"octo.head.diffusion.reverse.blk.{i}.{sub}.{leaf}")
+    elif head_type == "l1":
+        required.append("octo.head.l1.map.probe")
+        for leaf in ("weight", "bias"):
+            required.append(f"octo.head.l1.map.attn_qkv.{leaf}")
+            required.append(f"octo.head.l1.map.attn_o.{leaf}")
+            required.append(f"octo.head.l1.map.norm.{leaf}")
+            required.append(f"octo.head.l1.map.ffn_up.{leaf}")
+            required.append(f"octo.head.l1.map.ffn_down.{leaf}")
+            required.append(f"octo.head.l1.mean_proj.{leaf}")
+    else:
+        raise SystemExit(f"no required-tensor list for head_type {head_type!r}")
     required += ["octo.t5.tok_embd.weight", "octo.t5.blk.0.attn_rel_b.weight", "octo.t5.output_norm.weight"]
     for i in range(12):
         for stem in ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_o", "ffn_norm", "ffn_up", "ffn_down"):
@@ -321,6 +411,13 @@ def main() -> int:
     ap.add_argument("--window-size", type=int, default=None,
         help="override window_size written to octo.window_size GGUF meta; only needed "
              "if it can't be read from the checkpoint's config.json/finetune_config.json.")
+    ap.add_argument("--ckpt-format", choices=("auto", "jax", "pytorch"), default="auto",
+        help="checkpoint format to load --ckpt as: 'jax' (Orbax, via "
+             "OctoModelPt.load_pretrained_from_jax -- the original/default path) or "
+             "'pytorch' (native, via OctoModelPt.load_pretrained -- config.json + "
+             "dataset_statistics.json + <step>/weights.pth). 'auto' (default) detects "
+             "pytorch by the presence of <step>/weights.pth next to --ckpt; the default "
+             f"{MODEL_ID!r} (no --ckpt) always resolves to 'jax'.")
     args = ap.parse_args()
 
     if args.octo_root.exists():
@@ -329,8 +426,19 @@ def main() -> int:
     from octo.model.octo_model_pt import OctoModelPt
 
     model_id = args.ckpt if args.ckpt is not None else MODEL_ID
-    print(f"loading {model_id} via OctoModelPt.load_pretrained_from_jax (step={args.step}) ...")
-    loaded = OctoModelPt.load_pretrained_from_jax(model_id, step=args.step, skip_keys_regex=".*hf_model")
+    ckpt_format = args.ckpt_format
+    if ckpt_format == "auto":
+        ckpt_format = _detect_ckpt_format(args.ckpt, args.step)
+        print(f"--ckpt-format auto detected: {ckpt_format}")
+
+    if ckpt_format == "pytorch":
+        if args.ckpt is None:
+            raise SystemExit("--ckpt-format pytorch requires --ckpt (a local PyTorch checkpoint dir)")
+        print(f"loading {model_id} via OctoModelPt.load_pretrained (step={args.step}) ...")
+        loaded = OctoModelPt.load_pretrained(model_id, step=args.step)
+    else:
+        print(f"loading {model_id} via OctoModelPt.load_pretrained_from_jax (step={args.step}) ...")
+        loaded = OctoModelPt.load_pretrained_from_jax(model_id, step=args.step, skip_keys_regex=".*hf_model")
     m = loaded["octo_model"]
     sd = m.state_dict()
 
@@ -338,6 +446,17 @@ def main() -> int:
     print(f"window_size = {window_size} (from "
           f"{'--window-size override' if args.window_size is not None else 'checkpoint config'})")
     OCTO_META["window_size"] = window_size
+
+    head_cfg = m.config["model"]["heads"]["action"]
+    head_type = _head_type_from_class(head_cfg["name"])
+    OCTO_META["action.head_type"] = head_type
+    OCTO_META["action.horizon"] = int(head_cfg["kwargs"]["action_horizon"])
+    OCTO_META["action.dim"] = int(head_cfg["kwargs"]["action_dim"])
+    print(f"action head: {head_cfg['name']} -> head_type={head_type} "
+          f"horizon={OCTO_META['action.horizon']} dim={OCTO_META['action.dim']}")
+
+    has_proprio = "proprio" in m.config["model"]["observation_tokenizers"]
+    print(f"has_proprio = {has_proprio} (from checkpoint config observation_tokenizers)")
 
     print("state_dict keys and shapes:")
     for key in sorted(sd):
@@ -360,7 +479,7 @@ def main() -> int:
         else:
             mapped[key] = dst
 
-    missing = _validate_required(mapped)
+    missing = _validate_required(mapped, head_type, has_proprio)
     if ignored:
         print("IGNORED STATE_DICT KEYS:")
         for key in sorted(ignored):
