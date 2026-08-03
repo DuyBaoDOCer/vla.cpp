@@ -268,23 +268,33 @@ def _resolve_window_size(model: Any, ckpt_arg: str | None, ckpt_path: str,
     finetunes such as cyrusneary/octo-finetuned-libero (1).
 
     Priority: --window-size override > finetune_config.json next to the checkpoint
-    > model.config (from the checkpoint's own config.json, set by
-    OctoModelPt.load_pretrained_from_jax). finetune_config.json wins when both are
-    present: it is the fully-resolved per-run training recipe (real dataset_dir,
-    real dataset_kwargs_list, real save paths), whereas a checkpoint's saved
-    config.json can retain the base architecture's window_size (the pos-embedding
-    weight table's native shape, inherited unchanged from the octo-small-1.5
-    pretrain) even when the finetune's data pipeline only ever fed it 1 timestep --
-    confirmed by hand for cyrusneary/octo-finetuned-libero/2025-06-20_..._175739:
-    config.json says window_size=2, but finetune_config.json (matching every other
-    fact about that run -- 4 LIBERO datasets, primary-only image_obs_keys, 60000
-    steps) says window_size=1 both at top level and under
+    > model.config["finetune_metadata"]["effective_window_size"] > model.config["window_size"]
+    (all three read from the checkpoint's own config.json / finetune_config.json).
+    finetune_config.json wins when present: it is the fully-resolved per-run training
+    recipe (real dataset_dir, real dataset_kwargs_list, real save paths), whereas a
+    checkpoint's saved config.json can retain the base architecture's window_size (the
+    pos-embedding weight table's native shape, inherited unchanged from the
+    octo-small-1.5 pretrain) even when the finetune's data pipeline only ever fed it
+    fewer timesteps -- confirmed by hand for cyrusneary/octo-finetuned-libero/
+    2025-06-20_..._175739: config.json says window_size=2, but finetune_config.json
+    (matching every other fact about that run -- 4 LIBERO datasets, primary-only
+    image_obs_keys, 60000 steps) says window_size=1 both at top level and under
     dataset_kwargs.traj_transform_kwargs.
+
+    Native PyTorch checkpoints (OctoModelPt.load_pretrained, e.g. the aloha
+    jitter2525 open-loop adapt run) have no finetune_config.json file at all, but
+    carry the same kind of discrepancy inside their own config.json: top-level
+    window_size=2 (inherited from the octo-small-1.5 pretrain this run was adapted
+    from) vs. config["finetune_metadata"]["effective_window_size"]=1 (the actual
+    window size this specific adapt run trained/evaluated with, logged by the
+    training script's own flags snapshot). effective_window_size, when present,
+    is therefore preferred over the bare top-level window_size for exactly the same
+    reason finetune_config.json is preferred over it.
 
     If neither resolves AND a custom --ckpt was given, fail loudly rather than
     silently guessing -- only the unmodified default MODEL_ID (rail-berkeley bridge,
-    which has no finetune_config.json) falls back to model.config, then to the
-    known bridge constant.
+    which has no finetune_config.json or finetune_metadata) falls back to
+    model.config, then to the known bridge constant.
     """
     if override is not None:
         return override
@@ -298,8 +308,12 @@ def _resolve_window_size(model: Any, ckpt_arg: str | None, ckpt_path: str,
                 return int(ws)
 
     cfg = getattr(model, "config", None)
-    if isinstance(cfg, dict) and "window_size" in cfg:
-        return int(cfg["window_size"])
+    if isinstance(cfg, dict):
+        effective_ws = (cfg.get("finetune_metadata") or {}).get("effective_window_size")
+        if effective_ws is not None:
+            return int(effective_ws)
+        if "window_size" in cfg:
+            return int(cfg["window_size"])
 
     if ckpt_arg is None:
         return DEFAULT_BRIDGE_WINDOW_SIZE
