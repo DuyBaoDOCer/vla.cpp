@@ -87,6 +87,9 @@ struct OctoModelArch : public ModelArchBase {
     int64_t window_size = 2;
     int64_t action_horizon = 4;
     int64_t action_dim = 7;
+    // "diffusion" (default, backward-compat for GGUFs converted before this key existed)
+    // or "l1" (aloha jitter-adapted L1 head; forward not wired yet -- TIP-05).
+    std::string head_type = "diffusion";
     int64_t primary_tokens = 256;
     int64_t wrist_tokens = 64;
     int64_t language_tokens = 16;
@@ -147,13 +150,18 @@ bool load_config(const gguf_reader& g, OctoModelArch& m) {
     m.window_size = g.u32("octo.window_size");
     m.action_horizon = g.u32("octo.action.horizon");
     m.action_dim = g.u32("octo.action.dim");
+    // octo.action.head_type is optional: GGUFs converted before this key existed (all
+    // pre-TIP-03 diffusion checkpoints) default to "diffusion", their sole prior behavior.
+    m.head_type = g.has("octo.action.head_type") ? g.str("octo.action.head_type") : "diffusion";
     m.primary_tokens = g.u32("octo.tokens.primary");
     m.wrist_tokens = g.u32("octo.tokens.wrist");
     m.language_tokens = g.u32("octo.tokens.language");
     m.diffusion_steps = g.u32("octo.diffusion.steps");
 
-    if (m.hidden != 384 || m.blocks != 12 || m.heads != 6 || m.ffn != 1536 ||
-        m.action_horizon != 4 || m.action_dim != 7) {
+    // action_horizon is per-checkpoint (diffusion libero=4, L1 aloha jitter-adapted=20);
+    // action_dim stays fixed at 7 (the octo-small-1.5 backbone's action-dim constant,
+    // shared by every head type) along with the other M0 backbone consts below.
+    if (m.hidden != 384 || m.blocks != 12 || m.heads != 6 || m.ffn != 1536 || m.action_dim != 7) {
         std::fprintf(stderr, "vla(octo): metadata does not match octo-small-1.5 M0 constants\n");
         return false;
     }
@@ -1242,9 +1250,10 @@ static bool run_score_actor_graph_resident(ggml_context * ctx_w, ggml_backend_t 
                                            const std::vector<float>& noisy_action,
                                            int time_value,
                                            int window_size,
+                                           int action_total,
                                            std::vector<float>& pred_eps) {
     constexpr int hidden = 384;
-    constexpr int action = 28;
+    const int action = action_total;
     const int width = window_size;
     constexpr float ln_eps = 1e-6f;
     constexpr float two_pi = 6.2831853071795864769f;
@@ -1388,10 +1397,11 @@ static bool run_diffusion_resident(ggml_context * ctx_w, ggml_backend_t backend,
                                    const OctoNoiseSource& noise,
                                    const std::vector<float>& readout_action,
                                    int window_size,
+                                   int action_total,
                                    OctoDiffusionResult& result) {
     constexpr int steps = 20;
     const int width = window_size;
-    constexpr int action = 28;
+    const int action = action_total;
     constexpr float max_action = 5.0f;
     if (readout_action.size() != (size_t) 384 * width) return false;
 
@@ -1399,12 +1409,12 @@ static bool run_diffusion_resident(ggml_context * ctx_w, ggml_backend_t backend,
     std::string prefix;
     if (noise.kind == OctoNoiseSourceKind::REPLAY) {
         prefix = noise.case_dir + "/tensors/action_head.predict_action.";
-        if (!load_f32_shape(prefix + "initial_noise.npy", {1, window_size, 28}, result.initial_noise)) return false;
+        if (!load_f32_shape(prefix + "initial_noise.npy", {1, window_size, action}, result.initial_noise)) return false;
         NpyBool action_mask;
         if (!parse_npy_bool(prefix + "action_mask.npy", action_mask) || action_mask.shape != std::vector<int64_t>({1, window_size, 4, 7})) return false;
         result.action_mask = std::move(action_mask.data);
         NpyBool flat_mask;
-        if (!parse_npy_bool(prefix + "flat_action_mask.npy", flat_mask) || flat_mask.shape != std::vector<int64_t>({1, window_size, 28})) return false;
+        if (!parse_npy_bool(prefix + "flat_action_mask.npy", flat_mask) || flat_mask.shape != std::vector<int64_t>({1, window_size, action})) return false;
         result.flat_action_mask = std::move(flat_mask.data);
     } else {
         result.initial_noise.resize((size_t) width * action);
@@ -1421,12 +1431,12 @@ static bool run_diffusion_resident(ggml_context * ctx_w, ggml_backend_t backend,
     for (int step = 0; step < steps; ++step) {
         const int time_value = steps - 1 - step;
         result.current_x_before[(size_t) step] = x;
-        if (!run_score_actor_graph_resident(ctx_w, backend, readout_action, x, time_value, window_size, result.pred_eps[(size_t) step])) return false;
+        if (!run_score_actor_graph_resident(ctx_w, backend, readout_action, x, time_value, window_size, action_total, result.pred_eps[(size_t) step])) return false;
 
         if (noise.kind == OctoNoiseSourceKind::REPLAY) {
             char stem[96];
             std::snprintf(stem, sizeof(stem), "step_%02d.t_%02d.", step, time_value);
-            if (!load_f32_shape(prefix + stem + "z.npy", {1, window_size, 28}, result.z[(size_t) step])) return false;
+            if (!load_f32_shape(prefix + stem + "z.npy", {1, window_size, action}, result.z[(size_t) step])) return false;
         } else if (time_value > 0) {
             result.z[(size_t) step].resize((size_t) width * action);
             for (float& v : result.z[(size_t) step]) v = normal(*noise.rng);
@@ -1540,7 +1550,9 @@ static bool resolve_unnorm_dataset_key(const nlohmann::json& stats, std::string&
     return false;
 }
 
-// Un-normalizes a [4,7] flattened action using octo.dataset_statistics's
+// Un-normalizes a [horizon,7] flattened action (horizon = normalized_flat.size()/7 --
+// action_dim is fixed at 7 across every head type, only action_horizon varies: 4 for
+// diffusion libero, 20 for the L1 aloha jitter-adapted head) using octo.dataset_statistics's
 // per-dataset action mean/std/mask: unnorm[d] = mask[d] ? norm[d]*std[d]+mean[d]
 // : norm[d] (dims with mask=false, e.g. bridge_dataset's/libero_object's gripper dim 6,
 // are left as-is -- confirmed against golden: final_action_unnormalized[...,6] ==
@@ -1550,7 +1562,7 @@ static bool resolve_unnorm_dataset_key(const nlohmann::json& stats, std::string&
 // "bridge_dataset"); pass "" to auto-resolve via resolve_unnorm_dataset_key (live/serving
 // paths, where there's no golden to match against).
 static bool unnormalize_action(gguf_reader& g, const std::string& dataset_key_in,
-                               const std::vector<float>& normalized_28, std::vector<float>& unnorm_28) {
+                               const std::vector<float>& normalized_flat, std::vector<float>& unnorm_flat) {
     const std::string stats_json = g.str("octo.dataset_statistics");
     if (stats_json.empty()) {
         std::fprintf(stderr, "vla(octo): missing octo.dataset_statistics\n");
@@ -1571,15 +1583,18 @@ static bool unnormalize_action(gguf_reader& g, const std::string& dataset_key_in
     std::vector<float> mean = act.at("mean").get<std::vector<float>>();
     std::vector<float> stdv = act.at("std").get<std::vector<float>>();
     std::vector<bool> mask = act.at("mask").get<std::vector<bool>>();
-    if (mean.size() != 7 || stdv.size() != 7 || mask.size() != 7 || normalized_28.size() != 28) {
+    const size_t dim = mask.size();
+    if (mean.size() != dim || stdv.size() != dim || dim != 7 ||
+        normalized_flat.empty() || normalized_flat.size() % dim != 0) {
         std::fprintf(stderr, "vla(octo): unexpected dataset_statistics/action shape\n");
         return false;
     }
-    unnorm_28.resize(28);
-    for (int t = 0; t < 4; ++t) {
-        for (int d = 0; d < 7; ++d) {
-            const float norm = normalized_28[(size_t) t * 7 + d];
-            unnorm_28[(size_t) t * 7 + d] = mask[(size_t) d] ? (norm * stdv[(size_t) d] + mean[(size_t) d]) : norm;
+    const size_t horizon = normalized_flat.size() / dim;
+    unnorm_flat.resize(normalized_flat.size());
+    for (size_t t = 0; t < horizon; ++t) {
+        for (size_t d = 0; d < dim; ++d) {
+            const float norm = normalized_flat[t * dim + d];
+            unnorm_flat[t * dim + d] = mask[d] ? (norm * stdv[d] + mean[d]) : norm;
         }
     }
     return true;
@@ -1851,9 +1866,11 @@ std::unique_ptr<ModelArchBase> octo_create(const std::string& mmproj_path,
     // TIP-BUILD-OCTO-GPU-B: predict()'s 5 stages now consume these same weights (resident on
     // `m->backend` -- CUDA when available, CPU otherwise) directly; no separate CPU-only copy.
     if (!load_all_tensors(*m, m->io)) return nullptr;
-    std::printf("vla(octo): loaded %lld F32 tensors, hidden=%lld blocks=%lld heads=%lld horizon=%lld action_dim=%lld\n",
+    std::printf("vla(octo): loaded %lld F32 tensors, hidden=%lld blocks=%lld heads=%lld horizon=%lld "
+                "action_dim=%lld head_type=%s window_size=%lld\n",
                 (long long) m->tensors.size(), (long long) m->hidden, (long long) m->blocks,
-                (long long) m->heads, (long long) m->action_horizon, (long long) m->action_dim);
+                (long long) m->heads, (long long) m->action_horizon, (long long) m->action_dim,
+                m->head_type.c_str(), (long long) m->window_size);
     return m;
 }
 
@@ -1916,6 +1933,9 @@ bool octo_dump_tokenizer_case_resident(const std::string& ckpt_path,
     // uses for the live server, so this dump path is built exactly like a real model load.
     OctoModelArch m;
     m.matmul_type = GGML_TYPE_F32;
+    m.action_horizon = g.u32("octo.action.horizon");
+    m.action_dim = g.u32("octo.action.dim");
+    const int action_total = (int) (m.action_horizon * m.action_dim);
     m.backend = octo_select_backend(default_cpu_threads(), "[dump] ");
     if (!m.backend) return false;
     if (!load_all_tensors(m, g)) return false;
@@ -2015,26 +2035,26 @@ bool octo_dump_tokenizer_case_resident(const std::string& ckpt_path,
 
     OctoDiffusionResult diff;
     const OctoNoiseSource replay_noise{OctoNoiseSourceKind::REPLAY, case_dir, nullptr};
-    if (!run_diffusion_resident(ctx_w, backend, replay_noise, bt.readout_action, window_size, diff)) return false;
-    if (!write_f32_dump(dump_dir, "diff.initial_noise", diff.initial_noise, {1, window_size, 28}, mf)) return false;
+    if (!run_diffusion_resident(ctx_w, backend, replay_noise, bt.readout_action, window_size, action_total, diff)) return false;
+    if (!write_f32_dump(dump_dir, "diff.initial_noise", diff.initial_noise, {1, window_size, action_total}, mf)) return false;
     if (!write_bool_dump(dump_dir, "diff.action_mask", diff.action_mask, {1, window_size, 4, 7}, mf)) return false;
-    if (!write_bool_dump(dump_dir, "diff.flat_action_mask", diff.flat_action_mask, {1, window_size, 28}, mf)) return false;
+    if (!write_bool_dump(dump_dir, "diff.flat_action_mask", diff.flat_action_mask, {1, window_size, action_total}, mf)) return false;
     for (int step = 0; step < 20; ++step) {
         char boundary[64];
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.current_x_before", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.current_x_before[(size_t) step], {1, window_size, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.current_x_before[(size_t) step], {1, window_size, action_total}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.pred_eps", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.pred_eps[(size_t) step], {1, window_size, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.pred_eps[(size_t) step], {1, window_size, action_total}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.z", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.z[(size_t) step], {1, window_size, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.z[(size_t) step], {1, window_size, action_total}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_denoise", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.after_denoise[(size_t) step], {1, window_size, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.after_denoise[(size_t) step], {1, window_size, action_total}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_noise_add", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.after_noise_add[(size_t) step], {1, window_size, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.after_noise_add[(size_t) step], {1, window_size, action_total}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_clip", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.after_clip[(size_t) step], {1, window_size, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.after_clip[(size_t) step], {1, window_size, action_total}, mf)) return false;
         std::snprintf(boundary, sizeof(boundary), "diff.step%02d.x_after_mask", step);
-        if (!write_f32_dump(dump_dir, boundary, diff.after_mask[(size_t) step], {1, window_size, 28}, mf)) return false;
+        if (!write_f32_dump(dump_dir, boundary, diff.after_mask[(size_t) step], {1, window_size, action_total}, mf)) return false;
     }
     if (!write_f32_dump(dump_dir, "diff.actions_all_timesteps", diff.actions_all_timesteps, {1, window_size, 4, 7}, mf)) return false;
     if (!write_f32_dump(dump_dir, "sample_actions.final_action_normalized", diff.final_actions, {1, 4, 7}, mf)) return false;
@@ -2094,6 +2114,7 @@ bool octo_tokenize_text(const std::string& ckpt_path,
 // checkpoint or a caller that supplied no wrist view) -- its causal-mask key_valid entries
 // are forced false so the transformer treats it as absent padding, not a real observation.
 static bool octo_run_pipeline_resident(ggml_context * ctx_w, ggml_backend_t backend, gguf_reader& io, int window_size,
+                                       int action_total, const std::string& head_type,
                                        const NpyU8& primary_obs, const NpyU8& primary_task,
                                        const NpyU8& wrist_obs, const NpyU8& wrist_task, bool wrist_real,
                                        const std::vector<int32_t>& input_ids,
@@ -2104,6 +2125,15 @@ static bool octo_run_pipeline_resident(ggml_context * ctx_w, ggml_backend_t back
                                        float& ms_vision_out,
                                        float& ms_inference_out) {
     using clock = std::chrono::steady_clock;
+
+    // ADDITIVE (TIP-04): only the diffusion action head has a wired forward pass so far.
+    // The L1 head (aloha jitter-adapted checkpoints) loads fine (octo_create/load_config +
+    // load_all_tensors) but its forward is TIP-05's job -- fail loudly here instead of
+    // running the diffusion head against tensors that don't exist for an L1 checkpoint.
+    if (head_type != "diffusion") {
+        std::fprintf(stderr, "vla(octo): head_type=%s forward not implemented yet (TIP-05)\n", head_type.c_str());
+        return false;
+    }
 
     const auto t_vision0 = clock::now();
     std::vector<float> tok, primary_proj, primary_pos, wrist_proj, wrist_pos;
@@ -2146,7 +2176,7 @@ static bool octo_run_pipeline_resident(ggml_context * ctx_w, ggml_backend_t back
     std::mt19937 rng(rd());
     OctoDiffusionResult diff;
     const OctoNoiseSource live_noise{OctoNoiseSourceKind::RANDOM, "", &rng};
-    if (!run_diffusion_resident(ctx_w, backend, live_noise, bt.readout_action, window_size, diff)) return false;
+    if (!run_diffusion_resident(ctx_w, backend, live_noise, bt.readout_action, window_size, action_total, diff)) return false;
     normalized_out = std::move(diff.final_actions);
     ms_inference_out = std::chrono::duration<float, std::milli>(clock::now() - t_inference0).count();
 
@@ -2193,6 +2223,9 @@ bool octo_predict_from_images(const std::string& ckpt_path,
     // call (no persistent OctoModelArch survives past this function, unlike the live server).
     OctoModelArch m;
     m.matmul_type = GGML_TYPE_F32;
+    m.action_horizon = g.u32("octo.action.horizon");
+    m.action_dim = g.u32("octo.action.dim");
+    m.head_type = g.has("octo.action.head_type") ? g.str("octo.action.head_type") : "diffusion";
     m.backend = octo_select_backend(default_cpu_threads(), "[cli] ");
     if (!m.backend) return false;
     if (!load_all_tensors(m, g)) return false;
@@ -2205,7 +2238,9 @@ bool octo_predict_from_images(const std::string& ckpt_path,
     octo_build_cold_start_obs_task(wrist_rgb, wrist_w, wrist_h, 128, window_size, wrist_obs, wrist_task);
 
     float ms_vision = 0.f, ms_inference = 0.f;
-    return octo_run_pipeline_resident(m.ctx_weights, m.backend, g, window_size, primary_obs, primary_task, wrist_obs, wrist_task,
+    const int action_total = (int) (m.action_horizon * m.action_dim);
+    return octo_run_pipeline_resident(m.ctx_weights, m.backend, g, window_size, action_total, m.head_type,
+                                      primary_obs, primary_task, wrist_obs, wrist_task,
                                       /*wrist_real=*/true, input_ids, attention_mask, unnorm_dataset,
                                       out.normalized, out.unnormalized, ms_vision, ms_inference);
 }
@@ -2273,7 +2308,9 @@ std::vector<float> OctoModelArch::predict(const Inputs& in) {
 
     std::vector<float> normalized, unnormalized;
     float ms_vision = 0.f, ms_inference = 0.f;
-    if (!octo_run_pipeline_resident(ctx_weights, backend, io, (int) window_size, primary_obs, primary_task, wrist_obs, wrist_task,
+    const int action_total = (int) (action_horizon * action_dim);
+    if (!octo_run_pipeline_resident(ctx_weights, backend, io, (int) window_size, action_total, head_type,
+                                    primary_obs, primary_task, wrist_obs, wrist_task,
                                     wrist_real, input_ids, attention_mask, /*unnorm_dataset=*/"",
                                     normalized, unnormalized, ms_vision, ms_inference)) {
         return {};
@@ -2341,6 +2378,8 @@ bool octo_free_sample_case(const std::string& ckpt_path,
     // resident lookup).
     OctoModelArch m;
     m.matmul_type = GGML_TYPE_F32;
+    m.action_horizon = g.u32("octo.action.horizon");
+    m.action_dim = g.u32("octo.action.dim");
     m.backend = octo_select_backend(default_cpu_threads(), "[free-sample] ");
     if (!m.backend) return false;
     if (!load_all_tensors(m, g)) return false;
@@ -2351,8 +2390,8 @@ bool octo_free_sample_case(const std::string& ckpt_path,
     if (!readout_pos_r) return false;
     const std::vector<float> readout_pos = tensor_to_vec(readout_pos_r);
 
-    constexpr int action = 28;
-    samples_out.assign((size_t) n_samples * 4 * 7, 0.0f);
+    const int action = (int) (m.action_horizon * m.action_dim);
+    samples_out.assign((size_t) n_samples * (size_t) action, 0.0f);
     noise_out.assign((size_t) n_samples * (size_t) window_size * action, 0.0f);
 
     for (int i = 0; i < n_samples; ++i) {
@@ -2376,8 +2415,8 @@ bool octo_free_sample_case(const std::string& ckpt_path,
         std::mt19937 rng(seed + (uint32_t) i);
         OctoDiffusionResult diff;
         const OctoNoiseSource sample_noise{OctoNoiseSourceKind::RANDOM, "", &rng};
-        if (!run_diffusion_resident(ctx_w, backend, sample_noise, bt.readout_action, window_size, diff)) return false;
-        std::copy(diff.final_actions.begin(), diff.final_actions.end(), samples_out.begin() + (size_t) i * 28);
+        if (!run_diffusion_resident(ctx_w, backend, sample_noise, bt.readout_action, window_size, action, diff)) return false;
+        std::copy(diff.final_actions.begin(), diff.final_actions.end(), samples_out.begin() + (size_t) i * (size_t) action);
         std::copy(diff.initial_noise.begin(), diff.initial_noise.end(), noise_out.begin() + (size_t) i * (size_t) window_size * action);
     }
     return true;
