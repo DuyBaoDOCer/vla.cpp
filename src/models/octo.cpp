@@ -2710,6 +2710,153 @@ bool octo_predict_from_images(const std::string& ckpt_path,
                                       out.normalized, out.unnormalized, ms_vision, ms_inference);
 }
 
+// TIP-06: sole L1/proprio stagewise dump implementation. Mirrors
+// octo_dump_tokenizer_case_resident's structure/boilerplate (backend selection,
+// load_all_tensors, manifest handling) but drives the head_type=l1 resident stage functions
+// (TIP-05) instead of the diffusion ones, and reads its input from a case_dir written by the
+// Part A python dump script rather than a JAX/OctoPt golden trace directory.
+bool octo_dump_l1_stagewise_case_resident(const std::string& ckpt_path,
+                                          const std::string& case_dir,
+                                          const std::string& dump_dir,
+                                          const std::string& unnorm_dataset) {
+    gguf_reader g{"octo"};
+    if (!g.open(ckpt_path)) return false;
+    const int window_size = (int) g.u32("octo.window_size");
+    if (window_size < 1 || window_size > kMaxHorizon) {
+        std::fprintf(stderr, "vla(octo): octo.window_size=%d out of supported range [1, %d]\n",
+                     window_size, kMaxHorizon);
+        return false;
+    }
+
+    OctoModelArch m;
+    m.matmul_type = GGML_TYPE_F32;
+    m.action_horizon = g.u32("octo.action.horizon");
+    m.action_dim = g.u32("octo.action.dim");
+    m.head_type = g.has("octo.action.head_type") ? g.str("octo.action.head_type") : "diffusion";
+    detect_proprio(g, m.has_proprio, m.proprio_in_dim);
+    if (m.head_type != "l1" || !m.has_proprio) {
+        std::fprintf(stderr, "vla(octo): octo_dump_l1_stagewise_case_resident requires head_type=l1 "
+                              "and a proprio tokenizer (got head_type=%s has_proprio=%s)\n",
+                     m.head_type.c_str(), m.has_proprio ? "true" : "false");
+        return false;
+    }
+    const int action_total = (int) (m.action_horizon * m.action_dim);
+    m.backend = octo_select_backend(default_cpu_threads(), "[l1-dump] ");
+    if (!m.backend) return false;
+    if (!load_all_tensors(m, g)) return false;
+    ggml_context * ctx_w = m.ctx_weights;
+    ggml_backend_t backend = m.backend;
+
+    NpyU8 top_hwc, wrist_hwc;
+    if (!parse_npy_u8(case_dir + "/input.top_hwc_u8.npy", top_hwc)) return false;
+    if (!parse_npy_u8(case_dir + "/input.wrist_hwc_u8.npy", wrist_hwc)) return false;
+    if (top_hwc.shape != std::vector<int64_t>{256, 256, 3} || wrist_hwc.shape != std::vector<int64_t>{128, 128, 3}) {
+        std::fprintf(stderr, "vla(octo): unexpected l1-dump input image shape\n");
+        return false;
+    }
+    NpyF32 proprio_raw_npy;
+    if (!parse_npy_f32(case_dir + "/input.proprio_raw.npy", proprio_raw_npy) ||
+        proprio_raw_npy.data.size() != (size_t) kProprioTokens) {
+        std::fprintf(stderr, "vla(octo): unexpected l1-dump input.proprio_raw.npy shape\n");
+        return false;
+    }
+    std::ifstream instr_f(case_dir + "/input.instruction.txt");
+    if (!instr_f) {
+        std::fprintf(stderr, "vla(octo): cannot open %s/input.instruction.txt\n", case_dir.c_str());
+        return false;
+    }
+    const std::string instruction((std::istreambuf_iterator<char>(instr_f)), std::istreambuf_iterator<char>());
+
+    std::vector<int32_t> input_ids, attention_mask;
+    if (!octo_tokenize_text(ckpt_path, instruction, input_ids, attention_mask)) return false;
+
+    NpyU8 primary_obs, primary_task, wrist_obs, wrist_task;
+    octo_build_cold_start_obs_task(top_hwc.data.data(), 256, 256, 256, window_size, primary_obs, primary_task);
+    octo_build_cold_start_obs_task(wrist_hwc.data.data(), 128, 128, 128, window_size, wrist_obs, wrist_task);
+
+    std::ofstream mf(dump_dir + "/manifest.txt");
+    if (!mf) {
+        std::error_code ec;
+        std::filesystem::create_directories(dump_dir, ec);
+        if (ec) {
+            std::fprintf(stderr, "vla(octo): cannot create %s: %s\n", dump_dir.c_str(), ec.message().c_str());
+            return false;
+        }
+        mf.open(dump_dir + "/manifest.txt");
+    }
+    if (!mf) {
+        std::fprintf(stderr, "vla(octo): cannot write %s/manifest.txt\n", dump_dir.c_str());
+        return false;
+    }
+
+    // T0: proprio z-score normalize (same formula/stats source as octo_run_pipeline_resident)
+    // + proprio tokenizer forward (proj + pos_embd, PRE-transformer).
+    std::vector<float> proprio_mean, proprio_std;
+    if (!load_proprio_stats(g, unnorm_dataset, proprio_mean, proprio_std)) return false;
+    std::vector<float> proprio_norm((size_t) kProprioTokens);
+    for (int d = 0; d < kProprioTokens; ++d) {
+        proprio_norm[(size_t) d] = (proprio_raw_npy.data[(size_t) d] - proprio_mean[(size_t) d]) / proprio_std[(size_t) d];
+    }
+    if (!write_f32_dump(dump_dir, "t0.proprio_normalized", proprio_norm, {kProprioTokens}, mf)) return false;
+
+    std::vector<float> proprio_tokens;
+    if (!run_proprio_tokenizer_graph_resident(ctx_w, backend, proprio_norm, (int) m.proprio_in_dim, window_size, proprio_tokens)) return false;
+    if (!write_f32_dump(dump_dir, "t0.proprio_tokens", proprio_tokens, {1, window_size, kProprioTokens, 384}, mf)) return false;
+
+    std::vector<float> tok, primary_proj, primary_pos, wrist_proj, wrist_pos;
+    if (!run_one_obs_tokenizer_graph_resident(ctx_w, backend, "primary", primary_obs, primary_task, 256, 256, window_size, tok, primary_proj, primary_pos)) return false;
+    if (!run_one_obs_tokenizer_graph_resident(ctx_w, backend, "wrist", wrist_obs, wrist_task, 128, 64, window_size, tok, wrist_proj, wrist_pos)) return false;
+
+    std::vector<float> t5_out;
+    if (!run_t5_encoder_graph_resident(ctx_w, backend, input_ids, attention_mask, t5_out)) return false;
+    NpyF32 t5;
+    t5.shape = {1, 16, 768};
+    t5.data = t5_out;
+    std::vector<float> lang_proj, lang_pos, repeated;
+    if (!run_language_graph_resident(ctx_w, backend, t5, window_size, lang_proj, lang_pos, repeated)) return false;
+
+    ggml_tensor * readout_pos_r = wt(ctx_w, "octo.readout.action.pos_embd");
+    if (!readout_pos_r) return false;
+    const std::vector<float> readout_pos = tensor_to_vec(readout_pos_r);
+
+    NpyBool task_valid, primary_valid, wrist_valid, timestep_valid;
+    task_valid.shape = {1};
+    task_valid.data = {1};
+    primary_valid.shape = {1, window_size};
+    primary_valid.data.assign((size_t) window_size, 1);
+    wrist_valid.shape = {1, window_size};
+    wrist_valid.data.assign((size_t) window_size, 1);  // real wrist image, always valid
+    timestep_valid.shape = {1, window_size};
+    timestep_valid.data.assign((size_t) window_size, 0);
+    timestep_valid.data.back() = 1;  // cold start: only the last slot is the live frame
+
+    const int n_proprio = kProprioTokens;
+    OctoTransformerResult bt;
+    if (!assemble_transformer_input(lang_pos, primary_pos, wrist_pos, proprio_tokens, repeated, readout_pos, window_size, n_proprio, bt.input)) return false;
+    std::vector<float> blocked_mask;
+    if (!build_transformer_mask(task_valid, primary_valid, wrist_valid, timestep_valid, window_size, n_proprio, bt.blocked_mask, blocked_mask)) return false;
+    if (!run_transformer_graph_resident(ctx_w, backend, bt.input, blocked_mask, window_size, n_proprio, bt)) return false;
+
+    // T1/T2: readout_action tokens -- transformer OUTPUT, also the L1 head's INPUT.
+    if (!write_f32_dump(dump_dir, "t1t2.readout_action", bt.readout_action, {1, window_size, 1, 384}, mf)) return false;
+
+    OctoL1HeadResult l1;
+    if (!run_l1_action_head_graph_resident(ctx_w, backend, bt.readout_action, window_size, action_total, l1)) return false;
+    // T3: MAPHead internals (post out_proj pre-LN/MLP; post residual+MLP).
+    if (!write_f32_dump(dump_dir, "t3.map_attn_out", l1.map_attn_out, {1, window_size, 384}, mf)) return false;
+    if (!write_f32_dump(dump_dir, "t3.map_emb", l1.map_emb, {1, window_size, 1, 384}, mf)) return false;
+    // T4: mean_proj + tanh*max_action, ALL window timesteps.
+    if (!write_f32_dump(dump_dir, "t4.mean_normalized", l1.mean_normalized,
+                        {1, window_size, (int) m.action_horizon, (int) m.action_dim}, mf)) return false;
+
+    // T5: final unnormalized action (last window timestep only).
+    std::vector<float> unnorm_actions;
+    if (!unnormalize_action(g, unnorm_dataset, l1.final_actions, unnorm_actions)) return false;
+    if (!write_f32_dump(dump_dir, "t5.action_unnormalized", unnorm_actions,
+                        {1, (int) m.action_horizon, (int) m.action_dim}, mf)) return false;
+    return true;
+}
+
 // Server-facing entry point (vla-server, TIP-CLIENT): in.images[0] is the primary view,
 // in.images[1] the wrist view if the client sent one (single-camera checkpoints/clients
 // omit it -- zero-filled and masked invalid via octo_run_pipeline_resident's wrist_real=false, same

@@ -160,6 +160,37 @@ if(Python3_FOUND AND DEFINED ENV{VLA_OCTO_LIBERO_GOLDEN_DIR} AND DEFINED ENV{VLA
   endforeach()
 endif()
 
+# TIP-06: octo_l1_parity_dump + verify_octo_l1_parity.py, mirroring add_octo_parity_test's
+# shape but for the head_type=l1 forward path (TIP-05) against a stagewise OctoPt golden
+# dump (octo-pytorch-kamusarj's scripts/dump_l1_stagewise_golden.py, one case dir per
+# ep0 timestep -- ep0_t0/ep0_t8/ep0_t16). Gated on two env vars since neither the L1 GGUF
+# nor the golden dumps are committed:
+#   VLA_OCTO_L1_GOLDEN_DIR -- root containing ep0_t<N>/{input.*,t0..t5.*.npy,manifest.json}
+#   VLA_OCTO_L1_CKPT       -- path to the head_type=l1 GGUF (octo-aloha-jitter2525.gguf)
+add_executable(octo_l1_parity_dump octo_l1_parity_dump.cpp)
+target_include_directories(octo_l1_parity_dump PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(octo_l1_parity_dump PRIVATE vla_core)
+target_compile_options(octo_l1_parity_dump PRIVATE -Wall -Wextra)
+
+if(Python3_FOUND AND DEFINED ENV{VLA_OCTO_L1_GOLDEN_DIR} AND DEFINED ENV{VLA_OCTO_L1_CKPT})
+  foreach(OCTO_L1_CASE ep0_t0 ep0_t8 ep0_t16)
+    if(EXISTS "$ENV{VLA_OCTO_L1_GOLDEN_DIR}/${OCTO_L1_CASE}/manifest.json")
+      add_test(
+        NAME octo_l1_parity_${OCTO_L1_CASE}
+        COMMAND ${CMAKE_COMMAND}
+          -DCKPT=$ENV{VLA_OCTO_L1_CKPT}
+          -DCASE_DIR=$ENV{VLA_OCTO_L1_GOLDEN_DIR}/${OCTO_L1_CASE}
+          -DUNNORM_DATASET=
+          -DTOL=1e-4
+          -DDUMP_DIR=${CMAKE_BINARY_DIR}/octo_l1_parity/${OCTO_L1_CASE}
+          -DDUMPER=$<TARGET_FILE:octo_l1_parity_dump>
+          -DVERIFY=${CMAKE_SOURCE_DIR}/scripts/verify_octo_l1_parity.py
+          -DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}
+          -P ${CMAKE_SOURCE_DIR}/tests/run_octo_l1_parity.cmake)
+    endif()
+  endforeach()
+endif()
+
 add_executable(test_vision_common test_vision_common.cpp)
 target_include_directories(test_vision_common PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(test_vision_common PRIVATE -Wall -Wextra)
