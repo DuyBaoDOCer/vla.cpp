@@ -1883,14 +1883,42 @@ static bool resolve_unnorm_dataset_key(const nlohmann::json& stats, std::string&
     return false;
 }
 
+// TIP-05V: octo.dataset_statistics comes in two shapes depending on how many datasets the
+// checkpoint's OctoModelPt.dataset_statistics covers -- nested-by-dataset-key (bridge/libero:
+// {"bridge_dataset": {"action":..., "proprio":...}, "<other dataset>": {...}, ...}, needing
+// resolve_unnorm_dataset_key to pick one) vs. FLAT single-dataset (the real
+// octo-aloha-jitter2525.gguf checkpoint: {"action":..., "proprio":..., "num_transitions":...,
+// "num_trajectories":...} directly, no dataset-name wrapper at all -- confirmed by inspecting
+// the GGUF's raw KV bytes; resolve_unnorm_dataset_key previously misread this flat object's 4
+// members as 4 candidate dataset NAMES and failed loudly, since none of them is a
+// single-key/bridge_dataset/env-var match). Detected by whether the object itself already has
+// an "action" member shaped like a stats block (has "mean") -- real dataset names never
+// collide with that. Every existing (nested) GGUF this codebase ships/tests against is
+// unaffected: their top level never has a member literally named "action".
+static bool resolve_stats_block(const nlohmann::json& j, const std::string& dataset_key_in,
+                                const nlohmann::json** out) {
+    if (j.is_object() && j.contains("action") && j["action"].is_object() && j["action"].contains("mean")) {
+        *out = &j;
+        return true;
+    }
+    std::string dataset_key = dataset_key_in;
+    if (dataset_key.empty() && !resolve_unnorm_dataset_key(j, dataset_key)) return false;
+    if (!j.contains(dataset_key)) {
+        std::fprintf(stderr, "vla(octo): dataset_statistics missing key %s\n", dataset_key.c_str());
+        return false;
+    }
+    *out = &j[dataset_key];
+    return true;
+}
+
 // TIP-05 Part A step 1: proprio z-score stats -- octo.dataset_statistics[dataset_key].proprio
 // (NOT .action; a sibling stat block in the same per-dataset JSON object). Convention: the
 // caller (harness/TIP-07) sends RAW proprio (RLDS state, original units) via Inputs::state;
 // this engine normalizes it here, once, before the proprio tokenizer runs -- mirrors
-// unnormalize_action's dataset-key resolution (same env var / single-key / bridge_dataset
-// fallback via resolve_unnorm_dataset_key) so both stat blocks always come from the same
-// resolved dataset, but is otherwise a separate, self-contained JSON read (no mask field --
-// TIP-05 doesn't mention one for proprio, unlike action's gripper-dim mask).
+// unnormalize_action's dataset-key resolution (same resolve_stats_block, so both stat blocks
+// always come from the same resolved dataset), but is otherwise a separate, self-contained
+// JSON read (no mask field -- TIP-05 doesn't mention one for proprio, unlike action's
+// gripper-dim mask).
 static bool load_proprio_stats(gguf_reader& g, const std::string& dataset_key_in,
                                std::vector<float>& mean, std::vector<float>& stdv) {
     const std::string stats_json = g.str("octo.dataset_statistics");
@@ -1903,13 +1931,13 @@ static bool load_proprio_stats(gguf_reader& g, const std::string& dataset_key_in
         std::fprintf(stderr, "vla(octo): octo.dataset_statistics is not valid JSON\n");
         return false;
     }
-    std::string dataset_key = dataset_key_in;
-    if (dataset_key.empty() && !resolve_unnorm_dataset_key(j, dataset_key)) return false;
-    if (!j.contains(dataset_key) || !j[dataset_key].contains("proprio")) {
-        std::fprintf(stderr, "vla(octo): dataset_statistics missing %s.proprio\n", dataset_key.c_str());
+    const nlohmann::json* block = nullptr;
+    if (!resolve_stats_block(j, dataset_key_in, &block)) return false;
+    if (!block->contains("proprio")) {
+        std::fprintf(stderr, "vla(octo): dataset_statistics stats block missing .proprio\n");
         return false;
     }
-    const auto& p = j[dataset_key]["proprio"];
+    const auto& p = (*block)["proprio"];
     mean = p.at("mean").get<std::vector<float>>();
     stdv = p.at("std").get<std::vector<float>>();
     if (mean.size() != (size_t) kProprioTokens || stdv.size() != (size_t) kProprioTokens) {
@@ -1928,8 +1956,9 @@ static bool load_proprio_stats(gguf_reader& g, const std::string& dataset_key_in
 // sample_actions.final_action_normalized[...,6] exactly, while masked-in dims match
 // a*std+mean to ~1e-5). dataset_key_in must match golden's metadata.unnormalization.dataset
 // when comparing against a golden trace (all shipped bridge golden cases use
-// "bridge_dataset"); pass "" to auto-resolve via resolve_unnorm_dataset_key (live/serving
-// paths, where there's no golden to match against).
+// "bridge_dataset"); pass "" to auto-resolve via resolve_stats_block (live/serving paths,
+// where there's no golden to match against; also transparently handles a flat/single-dataset
+// stats blob with no dataset-name wrapper, e.g. octo-aloha-jitter2525.gguf -- TIP-05V).
 static bool unnormalize_action(gguf_reader& g, const std::string& dataset_key_in,
                                const std::vector<float>& normalized_flat, std::vector<float>& unnorm_flat) {
     const std::string stats_json = g.str("octo.dataset_statistics");
@@ -1942,13 +1971,13 @@ static bool unnormalize_action(gguf_reader& g, const std::string& dataset_key_in
         std::fprintf(stderr, "vla(octo): octo.dataset_statistics is not valid JSON\n");
         return false;
     }
-    std::string dataset_key = dataset_key_in;
-    if (dataset_key.empty() && !resolve_unnorm_dataset_key(j, dataset_key)) return false;
-    if (!j.contains(dataset_key) || !j[dataset_key].contains("action")) {
-        std::fprintf(stderr, "vla(octo): dataset_statistics missing %s.action\n", dataset_key.c_str());
+    const nlohmann::json* block = nullptr;
+    if (!resolve_stats_block(j, dataset_key_in, &block)) return false;
+    if (!block->contains("action")) {
+        std::fprintf(stderr, "vla(octo): dataset_statistics stats block missing .action\n");
         return false;
     }
-    const auto& act = j[dataset_key]["action"];
+    const auto& act = (*block)["action"];
     std::vector<float> mean = act.at("mean").get<std::vector<float>>();
     std::vector<float> stdv = act.at("std").get<std::vector<float>>();
     std::vector<bool> mask = act.at("mask").get<std::vector<bool>>();
