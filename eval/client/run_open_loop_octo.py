@@ -276,9 +276,20 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=None, help="default: full episode length")
     ap.add_argument("--output-dir", required=True, type=Path)
     ap.add_argument("--recv-timeout-ms", type=int, default=120_000)
+    ap.add_argument("--model-label", default=None,
+                    help="Plot-title label for the checkpoint under evaluation (TIP-12: was "
+                         "hardcoded to a stale checkpoint name). Default: the "
+                         "--dataset-statistics parent directory name, e.g. "
+                         "'kamusarj_ep0raw_4500' for ~/octo_ckpts/kamusarj_ep0raw_4500/"
+                         "dataset_statistics.json -- this client never loads the GGUF "
+                         "itself (it only talks to an already-running vla-server), so the "
+                         "checkpoint directory name is the most reliable identifier "
+                         "available client-side.")
     args = ap.parse_args()
 
-    dataset_statistics = json.loads(args.dataset_statistics.expanduser().read_text())
+    dataset_statistics_path = args.dataset_statistics.expanduser()
+    model_label = args.model_label or dataset_statistics_path.parent.name
+    dataset_statistics = json.loads(dataset_statistics_path.read_text())
     action_stats = dataset_statistics["action"]
     action_dim = len(action_stats["mean"])
 
@@ -350,7 +361,7 @@ def main() -> None:
     plot_trajectory(
         predicted=predicted, target=target, state=state_units, valid=valid,
         inference_points=inference_points,
-        title=f"octo-aloha-jitter2525 | train trajectory {args.traj_index} | execution horizon {args.execution_horizon}",
+        title=f"{model_label} | train trajectory {args.traj_index} | execution horizon {args.execution_horizon}",
         output_path=plot_path,
     )
     np.savez_compressed(
