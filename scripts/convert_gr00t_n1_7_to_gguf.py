@@ -80,6 +80,42 @@ def _load_sharded(ckpt: Path) -> dict[str, torch.Tensor]:
                 out[k] = f.get_tensor(k)
     return out
 
+def _sidecar(ckpt: Path, name: str, required: bool):
+    """R12: sidecar JSON files (statistics.json, processor_config.json,
+    embodiment_id.json) live under <ckpt>/processor/, not <ckpt>/ directly."""
+    for p in (ckpt / name, ckpt / "processor" / name):
+        if p.exists():
+            print(f"  sidecar {name:<24} <- {p}")
+            return p.read_text(), p
+    if required:
+        raise SystemExit(
+            f"{name} not found in {ckpt}/ or {ckpt}/processor/. "
+            f"Without it the GGUF cannot unnormalize actions.")
+    print(f"  sidecar {name:<24} <- NOT FOUND (falling back to '{{}}')")
+    return "{}", None
+
+def _truthy(v) -> bool:
+    if isinstance(v, bool): return v
+    if isinstance(v, str):  return v.strip().lower() in ("true", "1", "yes")
+    if isinstance(v, (int, float)): return bool(v)
+    raise SystemExit(f"unexpected type for use_relative_action: {type(v)} = {v!r}")
+
+def _find_key(obj, key: str, path: str = ""):
+    """Recursively search a nested dict/list for `key`; return (value, path) or (None, None)."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key], f"{path}/{key}"
+        for k, v in obj.items():
+            found, found_path = _find_key(v, key, f"{path}/{k}")
+            if found_path is not None:
+                return found, found_path
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            found, found_path = _find_key(v, key, f"{path}[{i}]")
+            if found_path is not None:
+                return found, found_path
+    return None, None
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", type=Path, required=True, help="GR00T-N1.7-3B snapshot dir")
@@ -128,8 +164,9 @@ def main() -> int:
     CROP_FRACTION = float(cfg_json.get("crop_fraction", 0.95) or 0.95)
     ICS = cfg_json.get("image_crop_size", [230, 230]) or [230, 230]
     ITS = cfg_json.get("image_target_size", [256, 256]) or [256, 256]
-    USE_RELATIVE_ACTION = bool(cfg_json.get("use_relative_action", False))
     APPLY_SINCOS_STATE = bool(cfg_json.get("apply_sincos_state_encoding", False))
+    # USE_RELATIVE_ACTION is resolved later from processor/processor_config.json (D-21),
+    # not from config.json -- see below, after sidecars are loaded.
 
     print(f"loading sharded safetensors from {ckpt} ...")
     W = _load_sharded(ckpt)
@@ -159,18 +196,19 @@ def main() -> int:
                                  (n_dit, kept_dit, "dit"),
                                  (n_vsa, kept_vsa, "vl_self_attn")):
             if kept and got != len(kept):
-                raise SystemExit(f"{what}: state_dict co {got} layer, "
-                                  f"kept_layer_idx_list_{what} khai {len(kept)} -> {kept}")
+                raise SystemExit(f"{what}: state_dict has {got} layers but "
+                                  f"kept_layer_idx_list_{what} declares {len(kept)} -> {kept}")
         cfg_lm_from_config = LM_LAYERS_USED
         dmc_num_layers = AH["dit_layers"]
         vsac_num_layers = AH["vlsa_layers"]
         lm_layers = n_lm
         AH["dit_layers"] = n_dit
         AH["vlsa_layers"] = n_vsa
-        print(f"  pruned: lm {cfg_lm_from_config}->{n_lm}, "
-              f"dit {dmc_num_layers}->{n_dit}, vlsa {vsac_num_layers}->{n_vsa}")
+        print(f"  pruned checkpoint: lm {cfg_lm_from_config}->{n_lm}, "
+              f"dit {dmc_num_layers}->{n_dit}, vlsa {vsac_num_layers}->{n_vsa} "
+              f"(layer counts derived from state_dict)")
         print(f"  select_layer: config={cfg_json.get('select_layer')} "
-              f"-> hieu luc {n_lm} (qwen3_backbone.py:290 ghi de bang len(kept_layer_idx_list))")
+              f"-> effective {n_lm} (overridden by qwen3_backbone.py:290 to len(kept_layer_idx_list))")
     else:
         lm_layers = LM_LAYERS_USED          # unchanged behavior for base (non-pruned) checkpoints
         if int(cfg_json.get("select_layer", LM_LAYERS_USED)) != LM_LAYERS_USED:
@@ -191,12 +229,32 @@ def main() -> int:
     vlsa_ff_inner = 4 * AH["backbone_embedding_dim"]
     assert W["action_head.vl_self_attention.transformer_blocks.0.ff.net.0.proj.weight"].shape == (vlsa_ff_inner, AH["backbone_embedding_dim"])
 
-    statistics_json = (ckpt / "statistics.json").read_text() if (ckpt / "statistics.json").exists() else "{}"
-    processor_json = (ckpt / "processor_config.json").read_text() if (ckpt / "processor_config.json").exists() else "{}"
-    embodiment_id_json = (ckpt / "embodiment_id.json").read_text() if (ckpt / "embodiment_id.json").exists() else "{}"
-    proc_kwargs = json.loads(processor_json).get("processor_kwargs", {}) if processor_json != "{}" else {}
+    statistics_json,    stats_path = _sidecar(ckpt, "statistics.json",       required=True)
+    processor_json,     proc_path  = _sidecar(ckpt, "processor_config.json", required=True)
+    embodiment_id_json, emb_path   = _sidecar(ckpt, "embodiment_id.json",    required=False)
+
+    # D-21: use_relative_action must match observed PyTorch behavior, which reads
+    # processor_kwargs.use_relative_action -- NOT config.json (key is absent there).
+    proc = json.loads(processor_json)
+    proc_kwargs = proc.get("processor_kwargs", {})
+    if "use_relative_action" in proc_kwargs:
+        use_rel_raw = proc_kwargs["use_relative_action"]
+    else:
+        use_rel_raw, use_rel_path = _find_key(proc, "use_relative_action")
+        if use_rel_raw is None:
+            raise SystemExit(
+                "processor_config.json has no processor_kwargs.use_relative_action "
+                "(recursively searched the whole file, found nowhere). "
+                "D-21 requires reading it from the processor; silently falling back "
+                "to config.json is not allowed.")
+        print(f"  use_relative_action: found at nonstandard path: {use_rel_path}")
+    USE_RELATIVE_ACTION = _truthy(use_rel_raw)
+    print(f"  use_relative_action: processor={USE_RELATIVE_ACTION} "
+          f"| config.json={cfg_json.get('use_relative_action', '<KEY ABSENT>')}  (D-21: processor wins)")
+
     USE_PERCENTILES = bool(proc_kwargs.get("use_percentiles", True))
     CLIP_OUTLIERS = bool(proc_kwargs.get("clip_outliers", True))
+    print(f"  use_percentiles={USE_PERCENTILES} clip_outliers={CLIP_OUTLIERS}  (from processor_kwargs)")
 
     print(f"resolved cfg: vit=Qwen3-VL {VIT['vit_hidden']}d×{VIT['vit_layers']}L×{VIT['vit_heads']}h (Conv3d patch {VIT['patch_size']}², temporal {VIT['temporal_patch_size']}, "
           f"learned pos {VIT['vit_num_position_embeddings']}=48² + 2D rope; deepstack@{DEEPSTACK_IDXS}; merger LN={VIT['vit_hidden']} pre-merge / deepstack LN={c_merged} post-merge ⇒ "
