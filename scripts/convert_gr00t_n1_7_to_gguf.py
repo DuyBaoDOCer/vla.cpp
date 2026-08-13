@@ -95,8 +95,15 @@ def main() -> int:
     cfg_json = json.loads(cfg_path.read_text())
     if str(cfg_json.get("model_type", "")) != "Gr00tN1d7":
         raise SystemExit(f"config.json model_type is {cfg_json.get('model_type')!r}, expected 'Gr00tN1d7'")
-    if int(cfg_json.get("select_layer", LM_LAYERS_USED)) != LM_LAYERS_USED:
-        raise SystemExit(f"select_layer = {cfg_json.get('select_layer')}, expected {LM_LAYERS_USED}")
+
+    # R11: pruned checkpoints (CLP-style structural layer pruning) declare an
+    # architecture in config.json that predates pruning. The real layer counts
+    # come from the state_dict (see below); config.json is only cross-checked.
+    PRUNED   = bool(cfg_json.get("prune_model", False))
+    kept_bb  = list(cfg_json.get("kept_layer_idx_list_backbone")     or [])
+    kept_dit = list(cfg_json.get("kept_layer_idx_list_dit")          or [])
+    kept_vsa = list(cfg_json.get("kept_layer_idx_list_vl_self_attn") or [])
+
     AH["action_horizon"] = int(cfg_json.get("action_horizon", AH["action_horizon"]))
     AH["action_dim"] = int(cfg_json.get("max_action_dim", AH["action_dim"]))
     AH["max_state_dim"] = int(cfg_json.get("max_state_dim", AH["max_state_dim"]))
@@ -144,10 +151,33 @@ def main() -> int:
     n_vsa = _maxlayer("action_head.vl_self_attention.transformer_blocks.")
     n_ds  = _maxlayer(VS + "deepstack_merger_list.")
     if n_vit != VIT["vit_layers"]:   raise SystemExit(f"checkpoint has {n_vit} Qwen3-VL ViT layers, expected {VIT['vit_layers']}")
-    if n_lm  != LM_LAYERS_USED:      raise SystemExit(f"checkpoint has {n_lm} Qwen3-VL text layers, expected {LM_LAYERS_USED}")
-    if n_dit != AH["dit_layers"]:    raise SystemExit(f"checkpoint has {n_dit} DiT blocks, expected {AH['dit_layers']}")
-    if n_vsa != AH["vlsa_layers"]:   raise SystemExit(f"checkpoint has {n_vsa} vl_self_attention blocks, expected {AH['vlsa_layers']}")
     if n_ds  != len(DEEPSTACK_IDXS): raise SystemExit(f"checkpoint has {n_ds} deepstack mergers, expected {len(DEEPSTACK_IDXS)}")
+
+    if PRUNED:
+        # weight state_dict is the source of truth; config's kept_layer_idx_list_* (if present) is cross-checked
+        for got, kept, what in ((n_lm, kept_bb, "backbone"),
+                                 (n_dit, kept_dit, "dit"),
+                                 (n_vsa, kept_vsa, "vl_self_attn")):
+            if kept and got != len(kept):
+                raise SystemExit(f"{what}: state_dict co {got} layer, "
+                                  f"kept_layer_idx_list_{what} khai {len(kept)} -> {kept}")
+        cfg_lm_from_config = LM_LAYERS_USED
+        dmc_num_layers = AH["dit_layers"]
+        vsac_num_layers = AH["vlsa_layers"]
+        lm_layers = n_lm
+        AH["dit_layers"] = n_dit
+        AH["vlsa_layers"] = n_vsa
+        print(f"  pruned: lm {cfg_lm_from_config}->{n_lm}, "
+              f"dit {dmc_num_layers}->{n_dit}, vlsa {vsac_num_layers}->{n_vsa}")
+        print(f"  select_layer: config={cfg_json.get('select_layer')} "
+              f"-> hieu luc {n_lm} (qwen3_backbone.py:290 ghi de bang len(kept_layer_idx_list))")
+    else:
+        lm_layers = LM_LAYERS_USED          # unchanged behavior for base (non-pruned) checkpoints
+        if int(cfg_json.get("select_layer", LM_LAYERS_USED)) != LM_LAYERS_USED:
+            raise SystemExit(f"select_layer = {cfg_json.get('select_layer')}, expected {LM_LAYERS_USED}")
+        if n_lm  != lm_layers:           raise SystemExit(f"checkpoint has {n_lm} Qwen3-VL text layers, expected {lm_layers}")
+        if n_dit != AH["dit_layers"]:    raise SystemExit(f"checkpoint has {n_dit} DiT blocks, expected {AH['dit_layers']}")
+        if n_vsa != AH["vlsa_layers"]:   raise SystemExit(f"checkpoint has {n_vsa} vl_self_attention blocks, expected {AH['vlsa_layers']}")
 
     vocab = int(W[LM + "embed_tokens.weight"].shape[0])
     pe_w = W[VS + "patch_embed.proj.weight"]
@@ -170,7 +200,7 @@ def main() -> int:
 
     print(f"resolved cfg: vit=Qwen3-VL {VIT['vit_hidden']}d×{VIT['vit_layers']}L×{VIT['vit_heads']}h (Conv3d patch {VIT['patch_size']}², temporal {VIT['temporal_patch_size']}, "
           f"learned pos {VIT['vit_num_position_embeddings']}=48² + 2D rope; deepstack@{DEEPSTACK_IDXS}; merger LN={VIT['vit_hidden']} pre-merge / deepstack LN={c_merged} post-merge ⇒ "
-          f"merge÷{VIT['spatial_merge_size']})  lm=Qwen3-VL {QWEN3['lm_hidden']}d×{LM_LAYERS_USED}L ({QWEN3['lm_q_heads']}q/{QWEN3['lm_kv_heads']}kv×{QWEN3['lm_head_dim']}, θ={QWEN3['lm_rope_theta']:g})  "
+          f"merge÷{VIT['spatial_merge_size']})  lm=Qwen3-VL {QWEN3['lm_hidden']}d×{lm_layers}L ({QWEN3['lm_q_heads']}q/{QWEN3['lm_kv_heads']}kv×{QWEN3['lm_head_dim']}, θ={QWEN3['lm_rope_theta']:g})  "
           f"vocab={vocab} img_tok={IMAGE_TOKEN_INDEX}  vlsa={AH['vlsa_layers']}L×{AH['vlsa_heads']}h×{AH['vlsa_head_dim']} ff{vlsa_ff_inner}  "
           f"dit=AlternateVLDiT {AH['dit_layers']}L×{AH['dit_heads']}h×{AH['dit_head_dim']}(inner {AH['dit_hidden']}) attend_text_every_n={AH['attend_text_every_n_blocks']}  "
           f"in_emb={AH['input_embedding_dim']}  horizon={AH['action_horizon']} action_dim={AH['action_dim']} max_state={AH['max_state_dim']}  N_steps={AH['num_inference_timesteps']}  "
@@ -188,7 +218,7 @@ def main() -> int:
         n_img_tokens_per_view=64,
         shortest_image_edge=SHORTEST_EDGE, image_crop_size=int(ICS[0]), image_target_size=int(ITS[0]),
         deepstack_idx_0=DEEPSTACK_IDXS[0], deepstack_idx_1=DEEPSTACK_IDXS[1], deepstack_idx_2=DEEPSTACK_IDXS[2],
-        lm_hidden=QWEN3["lm_hidden"], lm_layers_used=LM_LAYERS_USED, lm_q_heads=QWEN3["lm_q_heads"],
+        lm_hidden=QWEN3["lm_hidden"], lm_layers_used=lm_layers, lm_q_heads=QWEN3["lm_q_heads"],
         lm_kv_heads=QWEN3["lm_kv_heads"], lm_head_dim=QWEN3["lm_head_dim"], lm_inter=QWEN3["lm_inter"],
         vocab_size=vocab, image_token_index=IMAGE_TOKEN_INDEX,
         vlsa_layers=AH["vlsa_layers"], vlsa_heads=AH["vlsa_heads"], vlsa_head_dim=AH["vlsa_head_dim"], vlsa_ff_inner=vlsa_ff_inner,
@@ -242,7 +272,7 @@ def main() -> int:
 
     _add(writer, "token_embd.weight",      g(LM + "embed_tokens.weight"))
     _add(writer, "vlm.output_norm.weight", g(LM + "norm.weight"))
-    for i in range(LM_LAYERS_USED):
+    for i in range(lm_layers):
         LL = f"{LM}layers.{i}."
         _add(writer, f"vlm.blk.{i}.attn_norm.weight", g(LL + "input_layernorm.weight"))
         for q in ("q", "k", "v"):
