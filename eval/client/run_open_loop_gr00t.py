@@ -53,6 +53,13 @@ kwargs as a side channel and then calls the REAL (unmodified) plot_trajectory_re
 still produce the .jpeg. No cut/concat/MSE/MAE/plot math is reimplemented anywhere in this
 file.
 
+TIP-11E adds --noise-npy: an optional fixed initial-noise array forwarded to the server via
+PredictRequest.noise (vla.proto:26, already wired end-to-end server.cpp:336-435 ->
+gr00tn1d7.cpp:787 -- no C++/protobuf changes needed). Lets the C++ engine and a
+correspondingly-monkeypatched Isaac-GR00T golden run start the 4-step Euler denoise from the
+identical sample, isolating cross-engine numerical drift from independent-noise-sampling
+variance. Default None: unchanged TIP-11B behavior (server samples its own N(0,1)).
+
 Usage:
     python run_open_loop_gr00t.py \
         --vla-addr tcp://localhost:5555 \
@@ -125,7 +132,8 @@ class Gr00tUR10eClient(VlaCppClient):
     _UR10E_STATE_DIMS = (6, 1)
 
     def __init__(self, vla_addr: str = "tcp://localhost:5555", *,
-                 state_q01: np.ndarray, state_q99: np.ndarray, **kwargs):
+                 state_q01: np.ndarray, state_q99: np.ndarray,
+                 noise_flat: np.ndarray | None = None, **kwargs):
         kwargs.pop("stats_json", None)
         kwargs.pop("arch", None)
         super().__init__(vla_addr, arch="gr00t_n1_7", stats_json=None, **kwargs)
@@ -136,6 +144,24 @@ class Gr00tUR10eClient(VlaCppClient):
         print(f"vla-cpp-direct[arch=gr00t_n1_7/ur10e]: state normalizer (q01/q99 + clip) "
               f"q01={self._ur10e_state_q01.tolist()} q99={self._ur10e_state_q99.tolist()}",
               flush=True)
+
+        # TIP-11E: caller-supplied initial noise for the action expert, injected into
+        # req.noise so C++ takes gr00tn1d7.cpp:787's `if (in.noise) memcpy(...)` path
+        # instead of sampling its own N(0,1). None (default) preserves TIP-11B behavior
+        # unchanged (server samples its own noise). Layout per TIP-11E Section B0: the
+        # server uploads this flat buffer byte-for-byte into a ggml tensor created as
+        # ggml_new_tensor_2d(C, GGML_TYPE_F32, AD, AH) (gr00tn1d7.cpp:806) -- ne[0]=AD=132
+        # is the fastest-varying dim -- so the flat array must be numpy (40, 132) C-order
+        # (AD fastest), no transpose.
+        self._noise_flat: np.ndarray | None = None
+        if noise_flat is not None:
+            self._noise_flat = np.ascontiguousarray(noise_flat, dtype=np.float32).reshape(-1)
+            if self._noise_flat.size != 5280:
+                raise ValueError(
+                    f"noise_flat must have 5280 elements (action_horizon=40 * "
+                    f"max_action_dim=132), got {self._noise_flat.size}")
+            print(f"[noise] n={self._noise_flat.size} sum={float(self._noise_flat.sum()):.6f}",
+                  flush=True)
 
     def _predict_chunk_gr00t_n1_7(self, observations: dict[str, Any]) -> np.ndarray:
         import re
@@ -211,6 +237,8 @@ class Gr00tUR10eClient(VlaCppClient):
             ip.data = img.tobytes()
         req.lang_tokens.extend(int(t) for t in lang)
         req.state.extend(float(x) for x in state_padded)
+        if self._noise_flat is not None:
+            req.noise.extend(float(x) for x in self._noise_flat)
 
         self.sock.send(req.SerializeToString())
         body = self.sock.recv()
@@ -339,6 +367,11 @@ def main() -> None:
     ap.add_argument("--recv-timeout-ms", type=int, default=120_000)
     ap.add_argument("--model-label", default=None,
                     help="Plot-title label; default: the --stats-json checkpoint dir name")
+    ap.add_argument("--noise-npy", default=None, type=Path,
+                    help="TIP-11E: .npy with the action expert's fixed initial noise, "
+                         "shape (40, 132) C-order (AD fastest -- see class docstring on "
+                         "Gr00tUR10eClient). Default None: server samples its own N(0,1) "
+                         "per call, unchanged TIP-11B behavior.")
     args = ap.parse_args()
 
     stats_path = args.stats_json.expanduser()
@@ -369,10 +402,15 @@ def main() -> None:
 
     modality_configs = load_ur10e_modality_config(args.ur10e_config.expanduser())
 
+    noise_flat = None
+    if args.noise_npy is not None:
+        noise_flat = np.load(args.noise_npy.expanduser()).astype(np.float32)
+
     client = Gr00tUR10eClient(
         vla_addr=args.vla_addr,
         state_q01=state_q01,
         state_q99=state_q99,
+        noise_flat=noise_flat,
         recv_timeout_ms=args.recv_timeout_ms,
     )
     policy = VlaCppPolicy(client, norm_params, modality_configs)
