@@ -15,6 +15,7 @@
 // Latency for one checkpoint. Synthetic inputs: engine only, no task success.
 
 #include "model.h"
+#include "options.h"
 #include "serving/hf_fetch.h"
 
 #include <algorithm>
@@ -23,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -33,6 +35,7 @@ void usage(const char * prog) {
         "usage: %s (--ckpt c.gguf | -hf user/repo) [--mmproj m.gguf]\n"
         "          [--label name] [--images N] [--size N] [--tokens N]\n"
         "          [--extra-token ID] [--extra-count N] [--warmup N] [--reps N] [--markdown]\n"
+        "          [precision flags]\n"
         "  --label    row label (default: the checkpoint filename)\n"
         "  --images   camera views (default 1)\n"
         "  --size     square input side in pixels (default 224)\n"
@@ -41,8 +44,9 @@ void usage(const char * prog) {
         "                 <embodied> tokens)\n"
         "  --warmup   untimed calls before measuring (default 3)\n"
         "  --reps     timed calls (default 20)\n"
-        "  --markdown print a markdown table row instead of a plain summary\n",
-        prog);
+        "  --markdown print a markdown table row instead of a plain summary\n"
+        "%s",
+        prog, vla::Options::usage());
 }
 
 // v must be sorted.
@@ -61,6 +65,8 @@ int main(int argc, char ** argv) {
     int n_images = 1, side = 224, n_tokens = 16, warmup = 3, reps = 20;
     int extra_token = -1, extra_count = 0;
     bool markdown = false;
+    vla::Options opts;
+    std::string opt_err;
 
     for (int i=1; i<argc; ++i) {
         const std::string a = argv[i];
@@ -84,6 +90,12 @@ int main(int argc, char ** argv) {
         else if (a == "--warmup")   warmup   = std::atoi(need("--warmup"));
         else if (a == "--reps")     reps     = std::atoi(need("--reps"));
         else if (a == "--markdown") markdown = true;
+        else if (opts.parse_arg(argc, argv, i, opt_err)) continue;
+        else if (!opt_err.empty()) {
+            std::fprintf(stderr, "vla-bench: %s\n", opt_err.c_str());
+            usage(argv[0]);
+            return 1;
+        }
         else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
@@ -117,7 +129,7 @@ int main(int argc, char ** argv) {
         label = (slash == std::string::npos) ? ckpt : ckpt.substr(slash+1);
     }
 
-    vla::Model * m = vla::model_load(mmproj, ckpt, "");
+    vla::Model * m = vla::model_load(mmproj, ckpt, "", opts);
     if (!m) {
         std::fprintf(stderr, "vla-bench: model_load failed\n");
         return 1;
@@ -184,14 +196,15 @@ int main(int argc, char ** argv) {
     const double lo     = ms.front();
     const double p50    = percentile(ms, 0.50);
     const double p90    = percentile(ms, 0.90);
+    const double mean   = std::accumulate(ms.begin(), ms.end(), 0.0)/(double) ms.size();
     const double vision = vision_sum/(double) reps;
 
     if (markdown) {
-        std::printf("| %s | %d | %d | %d | %.1f | %.1f | %.1f | %.1f |\n",
-                    label.c_str(), n_images, side, n_tokens, lo, p50, p90, vision);
+        std::printf("| %s | %d | %d | %d | %.1f | %.1f | %.1f | %.1f | %.1f |\n",
+                    label.c_str(), n_images, side, n_tokens, lo, mean, p50, p90, vision);
     } else {
-        std::printf("%s: min %.1f ms  p50 %.1f ms  p90 %.1f ms  vision %.1f ms  (%d views, %dx%d, %d tokens, %d reps)\n",
-                    label.c_str(), lo, p50, p90, vision, n_images, side, side, n_tokens, reps);
+        std::printf("%s: min %.1f ms  mean %.1f ms  p50 %.1f ms  p90 %.1f ms  vision %.1f ms  (%d views, %dx%d, %d tokens, %d reps)\n",
+                    label.c_str(), lo, mean, p50, p90, vision, n_images, side, side, n_tokens, reps);
     }
 
     vla::model_free(m);
