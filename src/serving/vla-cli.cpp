@@ -134,6 +134,31 @@ const char * arch_slug(Arch a) {
     return "";
 }
 
+#ifdef VLA_USE_OCTO
+bool octo_ckpt(const std::string & ckpt) {
+    Arch a;
+    return detect_arch_from_ckpt(ckpt, &a) && a == Arch::OCTO;
+}
+
+// Octo's tokenizer ships inside the checkpoint, so --text needs no Python here
+// and yields the attention mask its T5 encoder wants alongside the ids.
+bool octo_tokens(const std::string & ckpt, const std::string & text,
+                 std::vector<int32_t> & lang, std::vector<int32_t> & attn) {
+    if (octo_tokenize_text(ckpt, text, lang, attn))
+        return true;
+    std::fprintf(stderr, "vla-cli: octo tokenization failed\n");
+    return false;
+}
+#else
+bool octo_ckpt(const std::string &) {
+    return false;
+}
+
+bool octo_tokens(const std::string &, const std::string &, std::vector<int32_t> &, std::vector<int32_t> &) {
+    return false;
+}
+#endif
+
 // The instruction reaches a shell command, so keep it to plain prose.
 bool text_ok(const std::string & s) {
     if (s.empty() || s.size() > 512)
@@ -270,26 +295,10 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> attn;   // Octo only; empty leaves Inputs::attention_mask null.
     std::vector<float>   state;
 
-    Arch arch;
-    const bool have_arch = detect_arch_from_ckpt(ckpt, &arch);
-#ifdef VLA_USE_OCTO
-    if (have_arch && arch == Arch::OCTO) {
-        // Octo's T5 encoder needs the real padding mask, which ids alone do not
-        // carry, and its tokenizer ships inside the checkpoint -- so --text is
-        // both the supported and the cheaper route here.
-        if (text_s.empty()) {
-            std::fprintf(stderr, "vla-cli: octo needs --text (its predict() needs the attention "
-                                 "mask, which --tokens cannot express)\n");
+    if (octo_ckpt(ckpt) && !text_s.empty()) {
+        if (!octo_tokens(ckpt, text_s, lang, attn))
             return 1;
-        }
-        if (!octo_tokenize_text(ckpt, text_s, lang, attn)) {
-            std::fprintf(stderr, "vla-cli: octo tokenization failed\n");
-            return 1;
-        }
-    } else
-#endif
-    {
-        (void) have_arch;
+    } else {
         if (!text_s.empty()) {
             tokens_s = tokenize_text(ckpt, text_s);
             if (tokens_s.empty())

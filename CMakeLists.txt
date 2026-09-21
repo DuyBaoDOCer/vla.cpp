@@ -101,14 +101,12 @@ endfunction()
 vla_exclude_fetched_targets(${llama_SOURCE_DIR})
 
 # Octo is the one arch that tokenizes in-process, so it is also the one that
-# needs SentencePiece and, through it, a system protobuf. Optional so a build
-# that does not want Octo does not inherit that dependency.
+# needs SentencePiece and, through it, a protobuf. Optional so a build that does
+# not want Octo does not inherit that dependency.
 option(VLA_OCTO "Build the Octo arch (fetches SentencePiece, needs system protobuf)" ON)
 if(VLA_OCTO)
-    # Static, self-contained -- no shared lib, no test binaries, no tcmalloc. Uses
-    # the SYSTEM protobuf (not sentencepiece's vendored protobuf-lite 3.14) so it
-    # shares one protobuf runtime with the server's own .pb.cc code; vla-server
-    # aborts at static-init if two protobuf versions end up in the same binary.
+    # The system protobuf, not sentencepiece's vendored protobuf-lite: vla-server
+    # aborts at static-init if two protobuf runtimes reach the same binary.
     set(SPM_ENABLE_SHARED    OFF        CACHE BOOL   "" FORCE)
     set(SPM_BUILD_TEST       OFF        CACHE BOOL   "" FORCE)
     set(SPM_ENABLE_TCMALLOC  OFF        CACHE BOOL   "" FORCE)

@@ -25,21 +25,9 @@ from lerobot.processor.pipeline import PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION
 
 def octo_preprocess_image(frame: np.ndarray, image_size: int = 256) -> np.ndarray:
-    """Octo LIBERO preprocessing segment 1 (raw sim frame -> model_entry image).
-
-    Two steps, matching OctoPt's get_libero_image / dlimp preprocessing:
-      1. Rotate 180 (`[::-1, ::-1]`) -- the raw off-screen render comes out upside-down,
-         same convention already handled for evo1/gr00t above (Evo1PipelineAdapter,
-         Gr00tPipelineAdapter).
-      2. Resize to `image_size`. LIBERO's sim renders at 256x256 and Octo's primary
-         tokenizer also expects 256x256, so with the sim kept at 256 (see TIP-CLIENT --
-         do not change LIBERO's camera_heights/widths away from 256) this resize is an
-         identity; PIL LANCZOS only actually resamples if the render size ever differs
-         from `image_size`.
-    Verified against golden tier-A (raw.npy/model_entry.npy pairs): exact on
-    lossless-JPEG synthetic frames, within JPEG round-trip noise (~20 uint8 max_abs) on
-    photographic ones -- see TIP-P report.
-    """
+    # Rotate 180 like every other LIBERO adapter here (the off-screen render comes
+    # out upside-down), then resize. LIBERO renders at 256 and Octo's primary
+    # tokenizer wants 256, so the resize only bites if the camera is reconfigured.
     rotated = np.ascontiguousarray(frame[::-1, ::-1])
     if rotated.shape[0] == image_size and rotated.shape[1] == image_size:
         return rotated
@@ -178,29 +166,20 @@ class Gr00tN15PipelineAdapter(Gr00tPipelineAdapter):
     def parse_action(self, action: np.ndarray) -> np.ndarray:
         return np.asarray(action[:7], dtype=np.float32).copy()
 
+# The LIBERO finetunes are single-camera: their image_obs_keys never held a wrist
+# key, so sending the primary view alone is what the checkpoint trained on. Octo's
+# observation tokenizers are image-only, so there is no state to send either.
 class OctoPipelineAdapter(BasePipelineAdapter):
-    """cyrusneary/octo-finetuned-libero (window=1). Primary camera only, matching this
-    checkpoint's own single-camera finetune (its finetune_config.json image_obs_keys
-    never included a wrist key) -- vla-server zero-fills+masks-invalid the wrist slot for
-    us (octo.cpp:predict(), TIP-CLIENT), exactly reproducing what the checkpoint actually
-    trained on. No proprio/state input: Octo's observation_tokenizers are image-only.
-    """
-
-    def __init__(self, client: Any = None):
-        super().__init__(client)
 
     def parse_observation(self, obs: dict[str, Any]) -> dict[str, Any]:
-        primary = octo_preprocess_image(obs["pixels"]["image"], image_size=256)
         return {
-            "observation.images.image": primary,
+            "observation.images.image": octo_preprocess_image(obs["pixels"]["image"], image_size=256),
             "task": obs.get("task_description", ""),
         }
 
     def parse_action(self, action: np.ndarray) -> np.ndarray:
-        # octo.cpp:predict() already un-normalized (world units, dims 0..5) -- only the
-        # gripper (dim 6, Octo's own +1=open/0=close convention, passthrough/un-masked by
-        # unnormalize_action) needs converting to LIBERO's -1=open/+1=close and binarizing.
-        # Same formula as Evo1PipelineAdapter/Gr00tPipelineAdapter above.
+        # The server already returned world units. Only the gripper needs Octo's
+        # +1=open/0=close turned into LIBERO's -1=open/+1=close.
         action = np.asarray(action[:7], dtype=np.float32).copy()
         action[6] = -1.0 if action[6] > 0.5 else 1.0
         return action

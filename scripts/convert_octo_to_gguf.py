@@ -44,7 +44,7 @@ OCTO_META: dict[str, Any] = {
     "diffusion.steps": 20,
     "diffusion.beta_schedule": "cosine",
     "diffusion.s": 0.008,
-    "diffusion.max_action": 5,
+    "diffusion.max_action": 5.0,
     "diffusion.time_dim": 32,
     "diffusion.hidden": 256,
     "diffusion.num_blocks": 3,

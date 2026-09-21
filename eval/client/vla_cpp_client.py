@@ -56,11 +56,7 @@ ARCH_PRESETS = {
 
     "gr00t_n1_6": {"image_size": 224, "tokenizer": None, "max_state_dim": 128, "trust_remote_code": True},
 
-    # cyrusneary/octo-finetuned-libero (window=1) is genuinely single-camera -- its own
-    # finetune_config.json image_obs_keys={"primary": "image"} never fed a wrist view, so
-    # OctoPipelineAdapter sends primary only; the server zero-fills+masks-invalid the wrist
-    # slot (matches training distribution exactly). No proprio/state input (Octo's
-    # observation_tokenizers are image-only, see octo_pretrain_config.py) -> max_state_dim=0.
+    # Single-camera LIBERO finetune, image-only observations, so no state.
     "octo": {"image_size": 256, "tokenizer": "t5-base", "max_state_dim": 0, "max_length": 16},
 }
 
@@ -856,11 +852,9 @@ class VlaCppClient:
                   .reshape(resp.chunk_size, resp.action_dim))
 
     def _predict_chunk_octo(self, observations: dict[str, Any]) -> np.ndarray:
-        # observations come from OctoPipelineAdapter.parse_observation (adapters.py):
-        # already rotate180+resize256/128'd uint8 HWC images (TIP-P), primary-only for the
-        # genuinely single-camera cyrusneary checkpoint (image2 sent too if present, for a
-        # future two-camera Octo checkpoint -- vla-server zero-fills+masks-invalid whichever
-        # view it doesn't receive, octo.cpp:predict()).
+        # OctoPipelineAdapter has already rotated and resized these. A wrist view is
+        # sent when the observation carries one; a checkpoint without one just
+        # leaves that slot out of the sequence.
         images_u8: list[np.ndarray] = []
         for key in self.image_keys[:2]:
             if key not in observations:
@@ -878,11 +872,9 @@ class VlaCppClient:
         task = observations.get("task", "")
         if isinstance(task, bytes):
             task = task.decode()
-        # Same recipe as the checkpoint's own text_processor (octo_pretrain_config.py):
-        # t5-base, max_length=16, padding="max_length", truncation=True. Server's T5 encoder
-        # requires both input_ids and attention_mask at exactly this length (octo.cpp
-        # rejects anything else) -- unlike most archs, Octo needs the real mask, not a
-        # server-derived one.
+        # The checkpoint's own text_processor: t5-base, max_length=16,
+        # padding="max_length", truncation=True. Octo's T5 encoder needs the real
+        # padding mask, so it is sent alongside the ids.
         toks = self.tok(task, return_tensors="np", padding="max_length",
                         truncation=True, max_length=self.max_length)
         input_ids = toks["input_ids"][0].astype(np.int32)
@@ -907,11 +899,9 @@ class VlaCppClient:
         if resp.error:
             raise RuntimeError(f"vla-server error: {resp.error}")
         self._last_response = resp
-        # Already UN-normalized (world units) -- octo.cpp:predict() un-normalizes
-        # server-side (VLA_OCTO_UNNORM_DATASET / auto-resolve), unlike most archs which
-        # return normalized actions for the client to un-normalize via --stats-json. See
-        # TIP-CLIENT report for why (dataset_statistics is embedded in the multi-hundred-MB
-        # checkpoint GGUF, not a small sibling file a client can cheaply hold).
+        # World units already: Octo's dataset_statistics lives inside the checkpoint
+        # GGUF, so the server un-normalizes rather than handing the client a
+        # --stats-json it would have to extract from a multi-hundred-MB file.
         return (np.array(resp.action_chunk, dtype=np.float32)
                   .reshape(resp.chunk_size, resp.action_dim))
 
