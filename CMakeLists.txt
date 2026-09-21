@@ -116,7 +116,11 @@ if(VLA_OCTO)
         GIT_TAG        v0.2.0
         GIT_SHALLOW    TRUE
     )
+    # sentencepiece v0.2.0 still asks for cmake_minimum_required(VERSION 3.1),
+    # which CMake 4 refuses outright.
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
     FetchContent_MakeAvailable(sentencepiece)
+    unset(CMAKE_POLICY_VERSION_MINIMUM)
 endif()
 
 add_library(vla_core
