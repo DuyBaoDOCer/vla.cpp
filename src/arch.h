@@ -26,19 +26,30 @@
 #pragma once
 
 #include "model.h"
+#include "options.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
 
 namespace vla {
 
-// Default CPU thread count for the in-tree loaders: all cores, capped at 8,
-// with a safe fallback when the hardware count is unknown.
+// CPU threads for the in-tree loaders; VLA_N_THREADS overrides. Cap measured on
+// a 24-core host: 8 to 16 is 38-41% faster on vla_adapter, evo1 and gr00tn1d5,
+// and 24 is slower than 16. Output is bit-identical either way.
 inline int default_cpu_threads() {
+    if (const char * e = std::getenv("VLA_N_THREADS")) {
+        char * end = nullptr;
+        const long n = std::strtol(e, &end, 10);
+        if (*end == '\0' && n > 0 && n <= 1024)
+            return (int) n;
+        std::fprintf(stderr, "vla: ignoring VLA_N_THREADS='%s'\n", e);
+    }
     const unsigned hw = std::thread::hardware_concurrency();
-    return hw == 0 ? 4 : (int) std::min(hw, 8u);
+    return hw == 0 ? 4 : (int) std::min(hw, 16u);
 }
 
 /**
@@ -55,7 +66,7 @@ enum class Arch {
     GR00T_N1_5, // NVIDIA Isaac GR00T N1.5 (Eagle VLM + DiT action head).
     GR00T_N1_6, // NVIDIA Isaac GR00T N1.6 (Eagle Block-2A + DiT).
     GR00T_N1_7, // NVIDIA Isaac GR00T N1.7 (Qwen3 backbone + DiT).
-    OCTO,       // UC Berkeley Octo small 1.5 (M0 GGUF load only).
+    OCTO,       // UC Berkeley Octo small 1.5 (SmallStem16 + T5 + diffusion/L1 head).
     BITVLA,     // Microsoft BitVLA (1.58-bit ternary LM/ViT).
     VLA_ADAPTER,// OpenHelix VLA-Adapter DINOv2 + SigLIP + Bridge-Attention.
     OPENVLA_OFT,// DINOv2-L/14-reg4 + SigLIP-so400m/14 +Llama-2-7B + MLPResNet.
@@ -85,9 +96,9 @@ public:
 
     /**
      * @brief Run a full forward pass and return one chunk of normalised actions.
-     * @param in Vision + language + state inputs (see @ref Inputs).
+     * @param in Vision+language+state inputs (see @ref Inputs).
      * @return Flattened action chunk of length
-     *         @c cfg.num_steps * cfg.real_action_dim.
+     *         @c cfg.num_steps*cfg.real_action_dim.
      */
     virtual std::vector<float> predict(const Inputs& in) = 0;
 };
@@ -95,13 +106,14 @@ public:
 /**
  * @brief Build a SmolVLA model from its mmproj and checkpoint GGUFs.
  * @param mmproj_path Path to the vision-tower GGUF.
- * @param ckpt_path   Path to the LM + action-expert GGUF.
+ * @param ckpt_path   Path to the LM+action-expert GGUF.
  * @param config_path Optional JSON override; pass empty to use bundled config.
  * @return Owning pointer to the constructed model.
  */
 std::unique_ptr<ModelArchBase> smolvla_create(const std::string& mmproj_path,
                                               const std::string& ckpt_path,
-                                              const std::string& config_path);
+                                              const std::string& config_path,
+                                              const Options& opts);
 
 /**
  * @brief Build a pi0 model from its mmproj and checkpoint GGUFs.
@@ -109,7 +121,8 @@ std::unique_ptr<ModelArchBase> smolvla_create(const std::string& mmproj_path,
  */
 std::unique_ptr<ModelArchBase> pi0_create(const std::string& mmproj_path,
                                           const std::string& ckpt_path,
-                                          const std::string& config_path);
+                                          const std::string& config_path,
+                                              const Options& opts);
 
 /**
  * @brief Build a pi0.5 model from its mmproj and checkpoint GGUFs.
@@ -117,7 +130,8 @@ std::unique_ptr<ModelArchBase> pi0_create(const std::string& mmproj_path,
  */
 std::unique_ptr<ModelArchBase> pi05_create(const std::string& mmproj_path,
                                            const std::string& ckpt_path,
-                                           const std::string& config_path);
+                                           const std::string& config_path,
+                                              const Options& opts);
 
 /**
  * @brief Build an Evo-1 model. Vision is baked into @p ckpt_path; pass
@@ -126,7 +140,8 @@ std::unique_ptr<ModelArchBase> pi05_create(const std::string& mmproj_path,
  */
 std::unique_ptr<ModelArchBase> evo1_create(const std::string& mmproj_path,
                                            const std::string& ckpt_path,
-                                           const std::string& config_path);
+                                           const std::string& config_path,
+                                              const Options& opts);
 
 /**
  * @brief Build a GR00T N1.5 model. Vision is baked into @p ckpt_path.
@@ -134,7 +149,8 @@ std::unique_ptr<ModelArchBase> evo1_create(const std::string& mmproj_path,
  */
 std::unique_ptr<ModelArchBase> gr00t_n1_5_create(const std::string& mmproj_path,
                                                  const std::string& ckpt_path,
-                                                 const std::string& config_path);
+                                                 const std::string& config_path,
+                                              const Options& opts);
 
 /**
  * @brief Build a GR00T N1.6 model. Vision is baked into @p ckpt_path.
@@ -142,7 +158,8 @@ std::unique_ptr<ModelArchBase> gr00t_n1_5_create(const std::string& mmproj_path,
  */
 std::unique_ptr<ModelArchBase> gr00t_n1_6_create(const std::string& mmproj_path,
                                                  const std::string& ckpt_path,
-                                                 const std::string& config_path);
+                                                 const std::string& config_path,
+                                              const Options& opts);
 
 /**
  * @brief Build a GR00T N1.7 model. Vision is baked into @p ckpt_path.
@@ -150,16 +167,19 @@ std::unique_ptr<ModelArchBase> gr00t_n1_6_create(const std::string& mmproj_path,
  */
 std::unique_ptr<ModelArchBase> gr00t_n1_7_create(const std::string& mmproj_path,
                                                  const std::string& ckpt_path,
-                                                 const std::string& config_path);
+                                                 const std::string& config_path,
+                                              const Options& opts);
 
 /**
- * @brief Build an Octo model. TIP-001 M0 supports GGUF load/shape validation,
- *        not inference.
+ * @brief Build an Octo model. Vision, T5 text encoder and tokenizer vocab are
+ *        all baked into @p ckpt_path. Only compiled when VLA_OCTO is on.
  * @copydetails smolvla_create
  */
+#ifdef VLA_USE_OCTO
 std::unique_ptr<ModelArchBase> octo_create(const std::string& mmproj_path,
                                            const std::string& ckpt_path,
                                            const std::string& config_path);
+#endif
 
 /**
  * @brief Build a BitVLA model. Vision is baked into @p ckpt_path.
@@ -167,7 +187,8 @@ std::unique_ptr<ModelArchBase> octo_create(const std::string& mmproj_path,
  */
 std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
                                              const std::string& ckpt_path,
-                                             const std::string& config_path);
+                                             const std::string& config_path,
+                                              const Options& opts);
 
 /**
  * @brief Build a VLA-Adapter model. Vision is baked into @p ckpt_path.
@@ -175,7 +196,8 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
  */
 std::unique_ptr<ModelArchBase> vla_adapter_create(const std::string& mmproj_path,
                                                   const std::string& ckpt_path,
-                                                  const std::string& config_path);
+                                                  const std::string& config_path,
+                                              const Options& opts);
 
 /**
  * @brief Build a OpenVLA-OFT model. Vision is baked into @p ckpt_path.
@@ -183,7 +205,8 @@ std::unique_ptr<ModelArchBase> vla_adapter_create(const std::string& mmproj_path
  */
 std::unique_ptr<ModelArchBase> openvla_oft_create(const std::string& mmproj_path,
                                                   const std::string& ckpt_path,
-                                                  const std::string& config_path);
+                                                  const std::string& config_path,
+                                              const Options& opts);
 
 /**
  * @brief Build a VLA-JEPA model. Vision is baked into @p ckpt_path.
@@ -191,7 +214,8 @@ std::unique_ptr<ModelArchBase> openvla_oft_create(const std::string& mmproj_path
  */
 std::unique_ptr<ModelArchBase> vla_jepa_create(const std::string& mmproj_path,
                                                   const std::string& ckpt_path,
-                                                  const std::string& config_path);
+                                                  const std::string& config_path,
+                                              const Options& opts);
 
 /**
  * @brief Inspect a GGUF and identify the architecture tag.

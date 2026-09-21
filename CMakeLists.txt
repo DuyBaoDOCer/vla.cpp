@@ -11,38 +11,126 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+set(_vla_accel "")
+foreach(_flag GGML_CUDA GGML_SYCL GGML_METAL GGML_OPENVINO)
+    if(${_flag})
+        list(APPEND _vla_accel ${_flag})
+    endif()
+endforeach()
+list(LENGTH _vla_accel _vla_accel_n)
+if(_vla_accel_n GREATER 1)
+    string(REPLACE ";" ", " _vla_accel_str "${_vla_accel}")
+    message(FATAL_ERROR
+        "Enable one accelerator backend at a time; got ${_vla_accel_str}. "
+        "Configure a separate build directory per backend.")
+endif()
+# backend.h calls ggml_backend_<accel>_init directly, and GGML_BACKEND_DL builds
+# the accelerators as loadable modules that are not linked into ggml. Say so here
+# rather than at the undefined symbol.
+if(_vla_accel_n GREATER 0 AND GGML_BACKEND_DL)
+    message(FATAL_ERROR
+        "GGML_BACKEND_DL=ON is not supported with ${_vla_accel}: the backend is "
+        "built as a module and src/backend.h links its init directly.")
+endif()
+
 set(LLAMA_BUILD_COMMON   ON  CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS    ON  CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-# llama.cpp fetched + pinned at configure; bump = one-line GIT_TAG change.
+set(_vla_llama_patch "")
+if(GGML_CUDA)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(_vla_llama_patch PATCH_COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/patch_ggml_cuda_ext_hook.py <SOURCE_DIR>)
+elseif(GGML_OPENVINO)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(_vla_llama_patch PATCH_COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/patch_ggml_openvino.py <SOURCE_DIR>)
+
+    # Before the fetch: ggml's own ggml-openvino/CMakeLists.txt does
+    # find_package(OpenVINO REQUIRED ...) and would get there first, so this
+    # message only reaches anyone if it runs earlier. Same components it asks for.
+    find_package(OpenVINO QUIET COMPONENTS Runtime Threading)
+    if(NOT OpenVINO_FOUND)
+        message(FATAL_ERROR
+            "GGML_OPENVINO=ON but the OpenVINO runtime was not found. Install it "
+            "(scripts/install_ov.sh) and 'source /opt/intel/openvino/setupvars.sh' "
+            "in the shell that configures. See docs/backend/ov.md.")
+    endif()
+endif()
+# Overridable so a regression can be bisected against another tag in a separate
+# build dir (-DVLA_LLAMA_TAG=b10326) without editing this file. The patch
+# anchors in scripts/patch_ggml_cuda_ext_hook.py and scripts/patch_ggml_openvino.py
+# are checked against the default.
+set(_vla_llama_tag_default "b10729")
+set(VLA_LLAMA_TAG "${_vla_llama_tag_default}" CACHE STRING "llama.cpp tag to fetch")
+# A cache entry survives an edit to the line above, so an existing build dir keeps
+# the tag it was first configured with and quietly builds the wrong llama.cpp.
+if(NOT VLA_LLAMA_TAG STREQUAL _vla_llama_tag_default)
+    message(WARNING
+        "VLA_LLAMA_TAG is ${VLA_LLAMA_TAG}, not the default ${_vla_llama_tag_default}. "
+        "If that was not deliberate, this build dir predates the bump: reconfigure with "
+        "-DVLA_LLAMA_TAG=${_vla_llama_tag_default} or use a fresh one.")
+endif()
+
 include(FetchContent)
 FetchContent_Declare(llama
     GIT_REPOSITORY https://github.com/ggml-org/llama.cpp
-    GIT_TAG        b9866
+    GIT_TAG        ${VLA_LLAMA_TAG}
     GIT_SHALLOW    TRUE
+    ${_vla_llama_patch}
 )
 FetchContent_MakeAvailable(llama)
 
-# T5 SentencePiece tokenizer (Octo language instructions). Static, self-contained
-# -- no shared lib, no test binaries, no tcmalloc. Uses the SYSTEM protobuf
-# (not sentencepiece's vendored protobuf-lite 3.14) so it shares one protobuf
-# runtime with the server's own .pb.cc code (system protobuf) -- vla-server
-# aborts at static-init if two protobuf versions end up in the same binary.
-set(SPM_ENABLE_SHARED    OFF     CACHE BOOL   "" FORCE)
-set(SPM_BUILD_TEST       OFF     CACHE BOOL   "" FORCE)
-set(SPM_ENABLE_TCMALLOC  OFF     CACHE BOOL   "" FORCE)
-set(SPM_PROTOBUF_PROVIDER "package" CACHE STRING "" FORCE)
-FetchContent_Declare(sentencepiece
-    GIT_REPOSITORY https://github.com/google/sentencepiece
-    GIT_TAG        v0.2.0
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(sentencepiece)
+# Drop the whole fetched tree from the default build: llama.cpp's ~20 tool
+# binaries and their impl libraries are dead weight here. What we link (llama,
+# ggml, mtmd, llama-common) is still built, pulled in as a dependency. Walking
+# the tree rather than naming targets keeps a bump from adding them back. Any of
+# them builds on request: cmake --build build --target llama-mtmd-cli
+function(vla_exclude_fetched_targets dir)
+    get_property(subdirs DIRECTORY ${dir} PROPERTY SUBDIRECTORIES)
+    foreach(sub IN LISTS subdirs)
+        vla_exclude_fetched_targets(${sub})
+    endforeach()
+    get_property(targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(tgt IN LISTS targets)
+        set_target_properties(${tgt} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    endforeach()
+endfunction()
+vla_exclude_fetched_targets(${llama_SOURCE_DIR})
+
+# Octo is the one arch that tokenizes in-process, so it is also the one that
+# needs SentencePiece and, through it, a system protobuf. Optional so a build
+# that does not want Octo does not inherit that dependency.
+option(VLA_OCTO "Build the Octo arch (fetches SentencePiece, needs system protobuf)" ON)
+if(VLA_OCTO)
+    # Static, self-contained -- no shared lib, no test binaries, no tcmalloc. Uses
+    # the SYSTEM protobuf (not sentencepiece's vendored protobuf-lite 3.14) so it
+    # shares one protobuf runtime with the server's own .pb.cc code; vla-server
+    # aborts at static-init if two protobuf versions end up in the same binary.
+    set(SPM_ENABLE_SHARED    OFF        CACHE BOOL   "" FORCE)
+    set(SPM_BUILD_TEST       OFF        CACHE BOOL   "" FORCE)
+    set(SPM_ENABLE_TCMALLOC  OFF        CACHE BOOL   "" FORCE)
+    set(SPM_PROTOBUF_PROVIDER "package" CACHE STRING "" FORCE)
+    FetchContent_Declare(sentencepiece
+        GIT_REPOSITORY https://github.com/google/sentencepiece
+        GIT_TAG        v0.2.0
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(sentencepiece)
+endif()
 
 add_library(vla_core
     src/model.cpp
+    src/loader.cpp
+    src/options.cpp
+    src/modules/action_expert.cpp
+    src/modules/dit_head.cpp
+    src/modules/encoder.cpp
+    src/modules/prompt.cpp
+    src/modules/qwen3_lm.cpp
+    src/modules/siglip_vit.cpp
     src/models/smolvla.cpp
     src/models/pi0.cpp
     src/models/pi05.cpp
@@ -50,7 +138,6 @@ add_library(vla_core
     src/models/gr00tn1d5.cpp
     src/models/gr00tn1d6.cpp
     src/models/gr00tn1d7.cpp
-    src/models/octo.cpp
     src/models/bitvla.cpp
     src/models/vla_adapter.cpp
     src/models/openvla_oft.cpp
@@ -60,10 +147,15 @@ target_include_directories(vla_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${llama_SOURCE_DIR}/vendor
-    PRIVATE
-        ${sentencepiece_SOURCE_DIR}/src
 )
-target_link_libraries(vla_core PUBLIC llama ggml PRIVATE sentencepiece)
+# The VLA archs call no llama_* API; only vlm_core needs llama.
+target_link_libraries(vla_core PUBLIC ggml)
+if(VLA_OCTO)
+    target_sources(vla_core PRIVATE src/models/octo.cpp)
+    target_include_directories(vla_core PRIVATE ${sentencepiece_SOURCE_DIR}/src)
+    target_link_libraries(vla_core PRIVATE sentencepiece-static)
+    target_compile_definitions(vla_core PUBLIC VLA_USE_OCTO)
+endif()
 
 if(GGML_CUDA)
     target_compile_definitions(vla_core PUBLIC GGML_USE_CUDA)
@@ -71,9 +163,7 @@ if(GGML_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        # Emit SASS per supported GPU (real) and PTX (virtual) only for the newest
-        # arch, so future cards can JIT without shipping PTX for every target.
-        # Blackwell sm_100/sm_120 require CUDA >= 12.8.
+        # SASS per supported GPU, PTX only for the newest arch so future cards JIT.
         set(_vla_cuda_archs 80-real 86-real 87-real 89-real 90-real)
         set(_vla_cuda_ptx 90-virtual)
         if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.8)
@@ -97,6 +187,9 @@ if(GGML_CUDA)
         CUDA_SEPARABLE_COMPILATION ON
         POSITION_INDEPENDENT_CODE ON
     )
+    target_include_directories(bitvla_cuda_kernels PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
     target_compile_features(bitvla_cuda_kernels PRIVATE cxx_std_17)
     target_compile_options(bitvla_cuda_kernels PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -Xptxas=-O3>
@@ -105,10 +198,45 @@ if(GGML_CUDA)
     target_link_libraries(vla_core PRIVATE bitvla_cuda_kernels)
     target_compile_definitions(vla_core PUBLIC VLA_BITVLA_CUDA_KERNELS)
     target_include_directories(vla_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+
+    # ggml-cuda link: the hook resolves ggml_cuda_ext_forward out of it.
+    add_library(vla_cuda_ops STATIC src/cuda/vla_cuda_bf16.cu)
+    target_include_directories(vla_cuda_ops PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${llama_SOURCE_DIR}/ggml/include
+    )
+    set_target_properties(vla_cuda_ops PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE ON
+    )
+    target_compile_features(vla_cuda_ops PRIVATE cxx_std_17)
+    target_compile_options(vla_cuda_ops PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3 -Xptxas=-O3>
+    )
+    target_link_libraries(vla_cuda_ops PUBLIC CUDA::cublas CUDA::cudart ggml-cuda)
+    target_link_libraries(vla_core PRIVATE vla_cuda_ops)
 endif()
 
-if(GGML_METAL AND NOT GGML_CUDA)
+if(GGML_SYCL AND NOT GGML_CUDA)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+        message(FATAL_ERROR
+            "GGML_SYCL=ON needs the oneAPI DPC++ compiler, but CMAKE_CXX_COMPILER is "
+            "'${CMAKE_CXX_COMPILER_ID}'. Source /opt/intel/oneapi/setvars.sh and configure a "
+            "fresh build dir with -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx. "
+            "See docs/backend/sycl.md.")
+    endif()
+    target_compile_definitions(vla_core PUBLIC GGML_USE_SYCL)
+endif()
+
+# Precedence matches the ladder in src/backend.h.
+if(GGML_METAL AND NOT GGML_CUDA AND NOT GGML_SYCL)
     target_compile_definitions(vla_core PUBLIC GGML_USE_METAL)
+endif()
+
+if(GGML_OPENVINO AND NOT GGML_CUDA AND NOT GGML_SYCL AND NOT GGML_METAL)
+    # Only tells the archs which branch of the backend.h ladder to compile; the
+    # toolkit was located before the fetch above.
+    target_compile_definitions(vla_core PUBLIC GGML_USE_OPENVINO)
 endif()
 
 add_library(vlm_core
@@ -128,8 +256,6 @@ find_package(Protobuf REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZeroMQ REQUIRED IMPORTED_TARGET libzmq)
 
-# cppzmq (zmq.hpp) is the header-only C++ binding, packaged separately from the
-# libzmq C library (Debian/Ubuntu: cppzmq-dev). The servers #include <zmq.hpp>.
 find_path(CPPZMQ_INCLUDE_DIR NAMES zmq.hpp)
 if(NOT CPPZMQ_INCLUDE_DIR)
     message(FATAL_ERROR
@@ -188,6 +314,7 @@ add_executable(vlm-server
 )
 target_include_directories(vlm-server PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}/proto-gen
+    ${llama_SOURCE_DIR}/vendor/stb
     ${CPPZMQ_INCLUDE_DIR}
 )
 target_link_libraries(vlm-server PRIVATE
@@ -196,7 +323,18 @@ target_link_libraries(vlm-server PRIVATE
     PkgConfig::ZeroMQ
 )
 
-# One-shot inference CLI: image + tokens -> action, no server or simulator.
+add_library(vla SHARED src/vla_c_api.cpp)
+target_include_directories(vla
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(vla PRIVATE vla_core)
+set_target_properties(vla PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+    PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/include/vla.h
+)
+
 add_executable(vla-cli
     src/serving/vla-cli.cpp
 )
@@ -204,16 +342,25 @@ target_include_directories(vla-cli PRIVATE
     ${llama_SOURCE_DIR}/vendor/stb
 )
 target_link_libraries(vla-cli PRIVATE vla_core)
+# --text shells out to the tokenizer script; VLA_TOKENIZE_SCRIPT overrides it.
+target_compile_definitions(vla-cli PRIVATE VLA_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
-# --- First-party build hygiene (never applied to the vendored llama.cpp subtree) --
-set(VLA_FIRST_PARTY_TARGETS vla_core vlm_core vla-server vlm-server vla-cli)
+add_executable(vla-bench
+    src/serving/vla-bench.cpp
+)
+target_link_libraries(vla-bench PRIVATE vla_core)
+
+# Warnings and LTO for our own targets only, never the llama.cpp subtree.
+set(VLA_FIRST_PARTY_TARGETS vla_core vlm_core vla vla-server vlm-server vla-cli vla-bench)
+# The CUDA targets were the only first-party code compiled without warnings.
+if(GGML_CUDA)
+    list(APPEND VLA_FIRST_PARTY_TARGETS bitvla_cuda_kernels vla_cuda_ops)
+endif()
 
 foreach(tgt IN LISTS VLA_FIRST_PARTY_TARGETS)
-    # Warn on our own C++ only; nvcc device code keeps its own diagnostics.
     target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
 endforeach()
 
-# Link-time optimization on Release builds when the toolchain supports it.
 include(CheckIPOSupported)
 check_ipo_supported(RESULT VLA_IPO_OK OUTPUT VLA_IPO_MSG)
 if(VLA_IPO_OK AND CMAKE_BUILD_TYPE STREQUAL "Release")

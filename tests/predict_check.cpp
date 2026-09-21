@@ -18,13 +18,16 @@
 // others read it, so fixed noise is reproducible for all archs).
 //
 //   predict_check <ckpt.gguf> [mmproj.gguf] [n_images]
-//   env: VLA_IMG_SIZE (square input, default 224), VLA_BENCH_ITERS (>0 = time it)
+//   env: VLA_IMG_SIZE (square input, default 224), VLA_BENCH_ITERS (>0 = time it),
+//        VLA_TIMING=phase, VLA_EXTRA_TOKEN / VLA_EXTRA_COUNT
 
 #include "model.h"
+#include "options.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <ctime>
 #include <vector>
 
@@ -32,14 +35,25 @@ using namespace vla;
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <ckpt.gguf> [mmproj.gguf] [n_images]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <ckpt.gguf> [mmproj.gguf] [n_images] [options]\n%s", argv[0], Options::usage());
         return 1;
     }
     const char* ckpt     = argv[1];
     const char* mmproj   = (argc > 2 && argv[2][0] && argv[2][0] != '-') ? argv[2] : "";
-    const int   n_images = argc > 3 ? std::atoi(argv[3]) : 2;
+    const int   n_images = (argc > 3 && argv[3][0] != '-') ? std::atoi(argv[3]) : 2;
 
-    Model* m = model_load(mmproj, ckpt, "");
+    Options opts;
+    for (int i = 2; i < argc; ++i) {
+        if (argv[i][0] != '-') continue;
+        std::string err;
+        if (!opts.parse_arg(argc, argv, i, err)) {
+            if (!err.empty()) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+            std::fprintf(stderr, "unknown option %s\n", argv[i]);
+            return 1;
+        }
+    }
+
+    Model* m = model_load(mmproj, ckpt, "", opts);
     if (!m) {
         std::fprintf(stderr, "model_load failed\n");
         return 1;
@@ -64,7 +78,12 @@ int main(int argc, char** argv) {
         views[v] = ImageView{ imgbuf[v].data(), W, H, PixelFormat::U8 };
     }
 
+    // VLA-JEPA needs its <embodied> tokens; the others ignore the extras.
     std::vector<int32_t> lang = {1, 100, 200, 300, 400, 2};
+    if (const char* tok = std::getenv("VLA_EXTRA_TOKEN")) {
+        const char* cnt = std::getenv("VLA_EXTRA_COUNT");
+        lang.insert(lang.end(), (size_t)(cnt ? std::atoi(cnt) : 1), (int32_t)std::atoi(tok));
+    }
     std::vector<float>   state((size_t)cfg.max_state_dim, 0.0f);
     for (int i = 0; i < (int)cfg.real_state_dim; ++i) state[i] = 0.01f * (float)(i + 1);
 
@@ -80,7 +99,8 @@ int main(int argc, char** argv) {
     in.n_lang        = (int)lang.size();
     in.state         = state.data();
     in.noise         = noise.data();
-    in.timing_detail = TimingDetail::NONE;
+    const char* td = std::getenv("VLA_TIMING");
+    in.timing_detail = (td && std::string(td) == "phase") ? TimingDetail::PHASE : TimingDetail::NONE;
 
     std::vector<float> act = predict(m, in);
     std::printf("action_len=%zu\n", act.size());

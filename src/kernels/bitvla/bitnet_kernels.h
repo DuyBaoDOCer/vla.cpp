@@ -24,8 +24,8 @@
  * fragment multiply per tile.
  *
  * Two GEMM entry points are provided:
- *   * @ref ladder_int8xint2_kernel - single-row (M=1) decode kernel
- *     used for next-token / single-query inference.
+ *   * @ref ladder_int8xint2_kernel-single-row (M=1) decode kernel
+ *     used for next-token/single-query inference.
  *   * @ref ladder_int8xint2_kernel_m + @ref launch_ladder_int8xint2_m
  *     - multi-row (M>1) variant for prefill and ViT batches.
  *
@@ -80,11 +80,11 @@ __device__ void decode_i2s_to_i8s(T1 *_i2s, T2 *_i8s, const int N = 16)
   static constexpr uint I4s_TO_I8s_MAGIC_NUM = 0x00000000;
 
 #pragma unroll
-  for (int i = 0; i < (N / 4); i++)
+  for (int i=0; i<(N/4); i++)
   {
     asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                  : "=r"(i8s[i])
-                 : "r"(i2s >> (2 * i)), "n"(BOTTOM_MASK), "n"(I4s_TO_I8s_MAGIC_NUM), "n"(immLut));
+                 : "r"(i2s >> (2*i)), "n"(BOTTOM_MASK), "n"(I4s_TO_I8s_MAGIC_NUM), "n"(immLut));
     i8s[i] = __vsubss4(i8s[i], 0x02020202);
   }
 }
@@ -92,7 +92,7 @@ __device__ void decode_i2s_to_i8s(T1 *_i2s, T2 *_i8s, const int N = 16)
 /**
  * @brief Single-row ternary GEMM kernel (M = 1).
  *
- * Computes one row of @c dtype_transform[0,:] = (A * B^T) / s[0] * ws,
+ * Computes one row of @c dtype_transform[0,:] = (A * B^T)/s[0]*ws,
  * with @c A in int8, @c B packed as int2 (decoded on the fly), accumulated
  * in int32 via @c __dp4a, then scaled back to bf16. The output bias
  * @c ws is applied per @c ws_num column groups.
@@ -117,38 +117,38 @@ __global__ void __launch_bounds__(128) ladder_int8xint2_kernel(int8_t* __restric
   int red_buf0[1];
   in_thread_C_local[0] = 0;
   #pragma unroll
-  for (int k_0 = 0; k_0 < K/(K_per_loop * K_block_size); ++k_0) {
-    *(int4*)(A_local + 0) = *(int4*)(A + ((k_0 * K_per_loop * K_block_size) + (((int)threadIdx.x) * K_per_loop)));
+  for (int k_0=0; k_0<K/(K_per_loop * K_block_size); ++k_0) {
+    *(int4*)(A_local+0) = *(int4*)(A+((k_0*K_per_loop * K_block_size)+(((int)threadIdx.x)*K_per_loop)));
     B_reshape_local[0] = *(int*)(B +
-      (((int)blockIdx.x) * N_block_size * K / 4) +
-      (k_0 * K_block_size * K_per_loop * wmma_N / 4) +
-      ((((int)threadIdx.x) >> 1) * wmma_K * wmma_N / 4) +
-      ((((int)threadIdx.y) >> 3) * (wmma_K * wmma_N / 2) / 4) +
-      ((((int)threadIdx.x) & 1) * (wmma_K * wmma_N / 4) / 4) +
-      ((((int)threadIdx.y) & 7) * (wmma_K / 2) / 4)
+      (((int)blockIdx.x)*N_block_size * K/4) +
+      (k_0*K_block_size * K_per_loop * wmma_N/4) +
+      ((((int)threadIdx.x) >> 1)*wmma_K * wmma_N/4) +
+      ((((int)threadIdx.y) >> 3)*(wmma_K * wmma_N/2)/4) +
+      ((((int)threadIdx.x) & 1)*(wmma_K * wmma_N/4)/4) +
+      ((((int)threadIdx.y) & 7)*(wmma_K/2)/4)
       );
     decode_i2s_to_i8s(B_reshape_local, B_decode_local, 16);
     #pragma unroll
-    for (int k_2_0 = 0; k_2_0 < 4; ++k_2_0) {
-      in_thread_C_local[0] = __dp4a(*(int *)&A_local[((k_2_0 * 4))],*(int *)&B_decode_local[((k_2_0 * 4))], in_thread_C_local[0]);
+    for (int k_2_0=0; k_2_0<4; ++k_2_0) {
+      in_thread_C_local[0] = __dp4a(*(int *)&A_local[((k_2_0*4))],*(int *)&B_decode_local[((k_2_0*4))], in_thread_C_local[0]);
     }
   }
   red_buf0[0] = in_thread_C_local[0];
   #pragma unroll
-  for (int offset = K_block_size/2; offset > 0; offset /= 2) {
+  for (int offset=K_block_size/2; offset>0; offset /= 2) {
     red_buf0[0] += __shfl_down_sync(__activemask(), red_buf0[0], offset, K_block_size);
   }
-  int out_idx = ((((int)blockIdx.x) * N_block_size) + ((int)threadIdx.y));
-  int ws_idx = out_idx / (N / ws_num);
+  int out_idx = ((((int)blockIdx.x)*N_block_size)+((int)threadIdx.y));
+  int ws_idx = out_idx/(N/ws_num);
   if (threadIdx.x == 0)
-    dtype_transform[out_idx] = __float2bfloat16(((float)red_buf0[0]) / s[0] * ws[ws_idx]);
+    dtype_transform[out_idx] = __float2bfloat16(((float)red_buf0[0])/s[0]*ws[ws_idx]);
 }
 
 /**
  * @brief Multi-row ternary GEMM kernel (M > 1) using @c wmma fragments.
  *
  * Tiles M rows in chunks of @p M_ROWS per CTA. Each warp processes
- * @c TILES_PER_WARP = @p M_ROWS / 64 row-tiles, accumulating int32 via
+ * @c TILES_PER_WARP = @p M_ROWS/64 row-tiles, accumulating int32 via
  * @c wmma::mma_sync against B fragments decoded from the i2 pack into
  * shared memory.
  *
@@ -159,7 +159,7 @@ __global__ void __launch_bounds__(128) ladder_int8xint2_kernel(int8_t* __restric
  * @param A,B    Activation (int8) and weight (int2-packed int8) buffers.
  * @param out    bf16 output (M x N).
  * @param s,ws   Per-row activation scale and per-column-group output scale.
- * @param M      Actual row count (may be < blockDim.y * M_ROWS - tail
+ * @param M      Actual row count (may be < blockDim.y*M_ROWS-tail
  *               threads predicate against this).
  */
 template <int N, int K, int ws_num, int M_ROWS>
@@ -172,13 +172,13 @@ __global__ void __launch_bounds__(128) ladder_int8xint2_kernel_m(
   constexpr int N_block_size = 16;
   constexpr int K_per_loop = 16, wmma_K = 32, wmma_N = 16;
   constexpr int K_CHUNK = 128;
-  constexpr int TILES_PER_WARP = M_ROWS / (4 * 16);
+  constexpr int TILES_PER_WARP = M_ROWS/(4*16);
 
   const int tx  = (int)threadIdx.x;
   const int ty  = (int)threadIdx.y;
-  const int tid = ty * 8 + tx;
+  const int tid = ty*8+tx;
   const int warp = tid >> 5;
-  const int m_base = (int)blockIdx.y * M_ROWS;
+  const int m_base = (int)blockIdx.y*M_ROWS;
 
   __shared__ signed char A_smem[M_ROWS][K_CHUNK];
   __shared__ signed char W_smem[16][K_CHUNK];
@@ -191,35 +191,36 @@ __global__ void __launch_bounds__(128) ladder_int8xint2_kernel_m(
   wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> b_frag;
   wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc[TILES_PER_WARP];
   #pragma unroll
-  for (int t = 0; t < TILES_PER_WARP; ++t) wmma::fill_fragment(acc[t], 0);
+  for (int t=0; t<TILES_PER_WARP; ++t)
+      wmma::fill_fragment(acc[t], 0);
 
-  for (int k_0 = 0; k_0 < K / K_CHUNK; ++k_0) {
+  for (int k_0=0; k_0<K/K_CHUNK; ++k_0) {
     #pragma unroll
-    for (int r = 0; r < (M_ROWS * K_CHUNK / 16) / 128; ++r) {
-      const int idx = tid + r * 128;
+    for (int r=0; r<(M_ROWS * K_CHUNK/16)/128; ++r) {
+      const int idx = tid+r*128;
       const int m   = idx >> 3;
-      const int kk  = (idx & 7) * 16;
-      const int mrow = m_base + m;
-      const int8_t* aptr = A + ((mrow < M ? mrow : 0) * K) + k_0 * K_CHUNK + kk;
+      const int kk  = (idx & 7)*16;
+      const int mrow = m_base+m;
+      const int8_t* aptr = A+((mrow < M ? mrow : 0)*K)+k_0*K_CHUNK+kk;
       *(int4*)(&A_smem[m][kk]) = *(const int4*)aptr;
     }
     B_reshape_local[0] = *(int*)(B +
-      (((int)blockIdx.x) * N_block_size * K / 4) +
-      (k_0 * 8 * K_per_loop * wmma_N / 4) +
-      ((tx >> 1) * wmma_K * wmma_N / 4) +
-      ((ty >> 3) * (wmma_K * wmma_N / 2) / 4) +
-      ((tx & 1) * (wmma_K * wmma_N / 4) / 4) +
-      ((ty & 7) * (wmma_K / 2) / 4));
+      (((int)blockIdx.x)*N_block_size * K/4) +
+      (k_0*8*K_per_loop * wmma_N/4) +
+      ((tx >> 1)*wmma_K * wmma_N/4) +
+      ((ty >> 3)*(wmma_K * wmma_N/2)/4) +
+      ((tx & 1)*(wmma_K * wmma_N/4)/4) +
+      ((ty & 7)*(wmma_K/2)/4));
     decode_i2s_to_i8s(B_reshape_local, B_decode_local, 16);
-    *(int4*)(&W_smem[ty][tx * 16]) = *(int4*)(&B_decode_local[0]);
+    *(int4*)(&W_smem[ty][tx*16]) = *(int4*)(&B_decode_local[0]);
     __syncthreads();
 
     #pragma unroll
-    for (int k16 = 0; k16 < K_CHUNK / 16; ++k16) {
-      wmma::load_matrix_sync(b_frag, &W_smem[0][k16 * 16], K_CHUNK);
+    for (int k16=0; k16<K_CHUNK/16; ++k16) {
+      wmma::load_matrix_sync(b_frag, &W_smem[0][k16*16], K_CHUNK);
       #pragma unroll
-      for (int t = 0; t < TILES_PER_WARP; ++t) {
-        wmma::load_matrix_sync(a_frag[t], &A_smem[warp * 16 + t * 64][k16 * 16], K_CHUNK);
+      for (int t=0; t<TILES_PER_WARP; ++t) {
+        wmma::load_matrix_sync(a_frag[t], &A_smem[warp*16+t*64][k16*16], K_CHUNK);
         wmma::mma_sync(acc[t], a_frag[t], b_frag, acc[t]);
       }
     }
@@ -227,21 +228,21 @@ __global__ void __launch_bounds__(128) ladder_int8xint2_kernel_m(
   }
 
   #pragma unroll
-  for (int t = 0; t < TILES_PER_WARP; ++t)
-    wmma::store_matrix_sync(&C_smem[warp * 16 + t * 64][0], acc[t], 16, wmma::mem_row_major);
+  for (int t=0; t<TILES_PER_WARP; ++t)
+    wmma::store_matrix_sync(&C_smem[warp*16+t*64][0], acc[t], 16, wmma::mem_row_major);
   __syncthreads();
 
-  const int n_base = ((int)blockIdx.x) * N_block_size;
-  const int ws_idx = n_base / (N / ws_num);
+  const int n_base = ((int)blockIdx.x)*N_block_size;
+  const int ws_idx = n_base/(N/ws_num);
   const float wsv = ws[ws_idx];
   #pragma unroll
-  for (int e = 0; e < (M_ROWS * 16) / 128; ++e) {
-    const int lin = tid + e * 128;
+  for (int e=0; e<(M_ROWS*16)/128; ++e) {
+    const int lin = tid+e*128;
     const int ml  = lin >> 4;
     const int col = lin & 15;
-    const int m = m_base + ml;
+    const int m = m_base+ml;
     if (m < M)
-      out[m * N + n_base + col] = __float2bfloat16(((float)C_smem[ml][col]) / s[m] * wsv);
+      out[m * N+n_base+col] = __float2bfloat16(((float)C_smem[ml][col])/s[m]*wsv);
   }
 }
 
@@ -256,7 +257,194 @@ static inline void launch_ladder_int8xint2_m(
     int8_t* A, int8_t* B, __nv_bfloat16* out,
     float* s, float* ws, int M, cudaStream_t stream) {
   ladder_int8xint2_kernel_m<N, K, ws_num, M_ROWS>
-    <<<dim3(N / 16, (M + M_ROWS - 1) / M_ROWS, 1), dim3(8, 16, 1), 0, stream>>>(A, B, out, s, ws, M);
+    <<<dim3(N/16, (M+M_ROWS-1)/M_ROWS, 1), dim3(8, 16, 1), 0, stream>>>(A, B, out, s, ws, M);
+}
+
+/**
+ * @brief Multi-row ternary GEMM producing @p N_TILES column tiles per CTA.
+ *
+ * Same math as @ref ladder_int8xint2_kernel_m; the difference is reuse. That
+ * kernel gives each CTA a single 16-wide output tile, so the A block it stages
+ * into shared memory buys only 16 columns of work and the whole activation
+ * matrix is re-read N/16 times. At the production shapes that lands the GEMM
+ * at ~15 MAC/byte against a roofline balance point of ~152, i.e. bandwidth
+ * bound at roughly an eighth of the int8 tensor-core peak.
+ *
+ * Here one A block feeds @p N_TILES tiles: warp @c w owns tile
+ * @c blockIdx.x*N_TILES+w and sweeps every row-tile of the shared A block, so
+ * the per-CTA activation traffic is amortised over @p N_TILES times as many
+ * MACs. The weight pack is already blocked as contiguous (16 columns x K)
+ * groups, so tile @c t simply starts at @c t*16*K/4 bytes -- no repacking.
+ *
+ * @tparam N       Output column count.
+ * @tparam K       Reduction dimension.
+ * @tparam ws_num  Number of column groups sharing one scale entry.
+ * @tparam M_ROWS  Rows per CTA along M; must be a multiple of 16.
+ * @tparam N_TILES Column tiles per CTA; must equal the warp count (4).
+ */
+template <int N, int K, int ws_num, int M_ROWS, int N_TILES>
+__global__ void __launch_bounds__(128) ladder_int8xint2_kernel_m_wide(
+    int8_t* __restrict__ A, int8_t* __restrict__ B,
+    __nv_bfloat16* __restrict__ out,
+    float* __restrict__ s, float* __restrict__ ws, int M)
+{
+  using namespace nvcuda;
+  constexpr int K_per_loop = 16, wmma_K = 32, wmma_N = 16;
+  constexpr int K_CHUNK = 128;
+  constexpr int WARPS   = 4;
+  constexpr int M_TILES = M_ROWS/16;
+  constexpr int N_BLOCKS = N/16;   // total 16-wide column tiles in the matrix
+
+  // Warps split two ways. N_TILES of them take different column tiles (that is
+  // the A-reuse win); the remaining WARPS/N_TILES take different row ranges
+  // (that is parallelism, which matters when N is small enough that column
+  // tiles alone cannot fill the GPU). N_TILES == 1 reproduces the original
+  // kernel's mapping exactly.
+  constexpr int M_GROUPS = WARPS/N_TILES;
+  constexpr int M_PER_WARP = M_TILES/M_GROUPS;
+
+  // Row stride padded to break shared-memory bank conflicts: at a stride of
+  // 128 B every row of a 16-row fragment starts on bank 0, so each
+  // load_matrix_sync serialises 16 ways. 144 B (still a multiple of the 16 B
+  // that wmma requires for integer ldm) spreads them over 8 banks.
+  constexpr int SM_STRIDE = K_CHUNK+16;
+
+  const int tx   = (int)threadIdx.x;          // 0..7
+  const int ty   = (int)threadIdx.y;          // 0..15
+  const int tid  = ty*8+tx;               // 0..127
+  const int warp = tid >> 5;                  // 0..3
+  const int lane = tid & 31;
+  const int m_base = (int)blockIdx.y*M_ROWS;
+
+  __shared__ signed char A_smem[M_ROWS][SM_STRIDE];
+  __shared__ signed char W_smem[N_TILES][16][SM_STRIDE];
+  __shared__ int         C_smem[WARPS][16][16];
+
+  // Column tile this warp owns. N is not always a multiple of 16*N_TILES
+  // (the ViT's 4304 is 269 tiles), so tiles past the end are skipped rather
+  // than clamped -- clamping would double-write real columns.
+  const int my_tile = (int)blockIdx.x*N_TILES+(warp%N_TILES);
+  const bool my_tile_valid = my_tile < N_BLOCKS;
+  const int  m_tile_base = (warp/N_TILES)*M_PER_WARP;
+
+  int B_reshape_local[1];
+  signed char B_decode_local[K_per_loop];
+
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> a_frag;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> b_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc[M_PER_WARP];
+  #pragma unroll
+  for (int t=0; t<M_PER_WARP; ++t)
+      wmma::fill_fragment(acc[t], 0);
+
+  for (int k_0=0; k_0<K/K_CHUNK; ++k_0) {
+    #pragma unroll
+    for (int r=0; r<(M_ROWS * K_CHUNK/16)/128; ++r) {
+      const int idx = tid+r*128;
+      const int m   = idx >> 3;
+      const int kk  = (idx & 7)*16;
+      const int mrow = m_base+m;
+      const int8_t* aptr = A+((mrow < M ? mrow : 0)*K)+k_0*K_CHUNK+kk;
+      *(int4*)(&A_smem[m][kk]) = *(const int4*)aptr;
+    }
+
+    // All 128 threads cooperate on one weight tile at a time, reproducing the
+    // pack's swizzle exactly; only the tile base changes per j.
+    #pragma unroll
+    for (int j=0; j<N_TILES; ++j) {
+      const int tile = (int)blockIdx.x*N_TILES+j;
+      if (tile < N_BLOCKS) {
+        B_reshape_local[0] = *(int*)(B +
+          ((size_t)tile*16*K/4) +
+          (k_0*8*K_per_loop * wmma_N/4) +
+          ((tx >> 1)*wmma_K * wmma_N/4) +
+          ((ty >> 3)*(wmma_K * wmma_N/2)/4) +
+          ((tx & 1)*(wmma_K * wmma_N/4)/4) +
+          ((ty & 7)*(wmma_K/2)/4));
+        decode_i2s_to_i8s(B_reshape_local, B_decode_local, 16);
+        *(int4*)(&W_smem[j][ty][tx*16]) = *(int4*)(&B_decode_local[0]);
+      }
+    }
+    __syncthreads();
+
+    if (my_tile_valid) {
+      #pragma unroll
+      for (int k16=0; k16<K_CHUNK/16; ++k16) {
+        wmma::load_matrix_sync(b_frag, &W_smem[warp%N_TILES][0][k16*16], SM_STRIDE);
+        #pragma unroll
+        for (int t=0; t<M_PER_WARP; ++t) {
+          wmma::load_matrix_sync(a_frag, &A_smem[(m_tile_base+t)*16][k16*16], SM_STRIDE);
+          wmma::mma_sync(acc[t], a_frag, b_frag, acc[t]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (!my_tile_valid)
+      return;
+
+  const int n_base = my_tile*16;
+  const float wsv  = ws[n_base/(N/ws_num)];
+
+  // One row-tile at a time through a per-warp staging buffer: a full
+  // M_ROWS x 16 int32 buffer per warp would cost more shared memory than the
+  // A block it is meant to amortise.
+  #pragma unroll
+  for (int t=0; t<M_PER_WARP; ++t) {
+    wmma::store_matrix_sync(&C_smem[warp][0][0], acc[t], 16, wmma::mem_row_major);
+    __syncwarp();
+    #pragma unroll
+    for (int e=0; e<(16*16)/32; ++e) {
+      const int lin = lane+e*32;
+      const int ml  = lin >> 4;
+      const int col = lin & 15;
+      const int m   = m_base+(m_tile_base+t)*16+ml;
+      if (m < M)
+        out[(size_t)m * N+n_base+col] =
+            __float2bfloat16(((float)C_smem[warp][ml][col])/s[m]*wsv);
+    }
+    __syncwarp();
+  }
+}
+
+/**
+ * @brief Column tiles per CTA for a given BitVLA shape.
+ *
+ * More tiles means more A reuse per CTA but fewer CTAs overall, and the grid
+ * is only ceil(N/16/N_TILES) x ceil(M/128) against 82 SMs -- so past a point
+ * the reuse is paid for with an idle machine. The trade does not reduce to a
+ * function of N: q/o and down share N=2560 but want 4 and 2 respectively,
+ * because down's K=6912 makes each CTA long-running enough that wave
+ * quantisation costs more than the extra reuse saves.
+ *
+ * These are measured, not derived -- `tests/bitvla_gemm_check sweep` prints
+ * the table they come from, at the M each shape actually runs at (the LM sees
+ * the full ~600-token prompt, the ViT one 256-patch view per call).
+ */
+static constexpr int bitvla_n_tiles_for(int N, int K) {
+  return (N == 2560  && K == 2560) ? 4     // lm.q / lm.o
+       : (N == 640   && K == 2560) ? 2     // lm.k / lm.v
+       : (N == 13824 && K == 2560) ? 4     // lm.gate_up
+       : (N == 2560  && K == 6912) ? 2     // lm.down
+       : (N == 1152  && K == 1152) ? 2     // vit.q/k/v/o
+       : (N == 4304  && K == 1152) ? 4     // vit.fc1
+       : (N == 1152  && K == 4352) ? 2     // vit.fc2
+       : (N == 3840  && K == 2560) ? 4     // action head qkv
+       : 2;
+}
+
+/**
+ * @brief Launch helper for @ref ladder_int8xint2_kernel_m_wide.
+ */
+template <int N, int K, int ws_num, int M_ROWS, int N_TILES>
+static inline void launch_ladder_int8xint2_m_wide(
+    int8_t* A, int8_t* B, __nv_bfloat16* out,
+    float* s, float* ws, int M, cudaStream_t stream) {
+  constexpr int N_BLOCKS = N/16;
+  ladder_int8xint2_kernel_m_wide<N, K, ws_num, M_ROWS, N_TILES>
+    <<<dim3((N_BLOCKS+N_TILES-1)/N_TILES, (M+M_ROWS-1)/M_ROWS, 1),
+       dim3(8, 16, 1), 0, stream>>>(A, B, out, s, ws, M);
 }
 
 /**
@@ -284,42 +472,50 @@ __global__ void act_quant_kernel(
     const int m   = (int)blockIdx.x;
     const int tid = (int)threadIdx.x;
     const __nv_bfloat16* row_in  = in  + m * K;
-    int8_t*              row_out = out + m * K;
+    int8_t*              row_out = out+m * K;
 
     float local_max = 0.0f;
-    for (int k = tid; k < K; k += BLOCK_THREADS) {
+    for (int k=tid; k<K; k += BLOCK_THREADS) {
         float v = fabsf(__bfloat162float(row_in[k]));
-        if (v > local_max) local_max = v;
+        if (v > local_max)
+            local_max = v;
     }
 
-    for (int off = 16; off > 0; off >>= 1) {
+    for (int off=16; off>0; off >>= 1) {
         float other = __shfl_down_sync(0xffffffff, local_max, off);
-        if (other > local_max) local_max = other;
+        if (other > local_max)
+            local_max = other;
     }
 
     __shared__ float smem[32];
     const int warp_id = tid >> 5;
     const int lane    = tid & 31;
-    if (lane == 0) smem[warp_id] = local_max;
+    if (lane == 0)
+        smem[warp_id] = local_max;
     __syncthreads();
     if (warp_id == 0) {
-        float v = (tid < (BLOCK_THREADS + 31) / 32) ? smem[lane] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) {
+        float v = (tid < (BLOCK_THREADS+31)/32) ? smem[lane] : 0.0f;
+        for (int off=16; off>0; off >>= 1) {
             float other = __shfl_down_sync(0xffffffff, v, off);
-            if (other > v) v = other;
+            if (other > v)
+                v = other;
         }
-        if (lane == 0) smem[0] = v;
+        if (lane == 0)
+            smem[0] = v;
     }
     __syncthreads();
     const float amax  = smem[0] < 1e-5f ? 1e-5f : smem[0];
-    const float scale = 127.0f / amax;
-    if (tid == 0) scales[m] = scale;
+    const float scale = 127.0f/amax;
+    if (tid == 0)
+        scales[m] = scale;
 
-    for (int k = tid; k < K; k += BLOCK_THREADS) {
-        float v = __bfloat162float(row_in[k]) * scale;
+    for (int k=tid; k<K; k += BLOCK_THREADS) {
+        float v = __bfloat162float(row_in[k])*scale;
         float q = nearbyintf(v);
-        if (q >  127.0f) q =  127.0f;
-        if (q < -128.0f) q = -128.0f;
+        if (q >  127.0f)
+            q =  127.0f;
+        if (q < -128.0f)
+            q = -128.0f;
         row_out[k] = (int8_t)q;
     }
 }

@@ -56,7 +56,7 @@ Notes:
   accept the licence, or point `--tokenizer` at a local copy.
 - **GR00T** arches need `--stats-json <ckpt>/dataset_statistics.json` and an embodiment selected
   server-side via `VLA_GR00T_EMBODIMENT` (`new_embodiment` for N1.5, `libero_panda` for N1.6,
-  `libero_sim` for N1.7), plus `VLA_GR00T_BF16_WEIGHTS=1` to fit an 8 GB card.
+  `libero_sim` for N1.7). BF16 weights are the default, which is also what fits an 8 GB card.
 
 To sweep every model over `libero_object` tasks 0–9, use `eval/run_libero.sh -i <MODELS_ROOT>`.
 
@@ -66,7 +66,7 @@ So far only **GR00T-N1.6** is wired (the `gr00t-n1d6-bridge` checkpoint with the
 embodiment). Serve it, then drive from the SimplerEnv venv:
 
 ```bash
-VLA_GR00T_BF16_WEIGHTS=1 VLA_GR00T_EMBODIMENT=oxe_widowx \
+VLA_GR00T_EMBODIMENT=oxe_widowx \
     ./build/vla-server "$GR00T_N1D6_GGUF"
 
 eval/sim/simpler/simpler_uv/.venv/bin/python eval/client/run_simpler_client_direct.py \
@@ -78,6 +78,42 @@ eval/sim/simpler/simpler_uv/.venv/bin/python eval/client/run_simpler_client_dire
 
 `$VLA_STATS_JSON` is the `statistics.json` beside the bridge GGUF. The default 224-px GGUF
 mis-localises on WidowX (≈20% success); the 252-px build is required.
+
+## Running with Docker Compose
+
+The current Compose stack is defined in `eval/docker-compose.yml`. It builds two services:
+
+- `server`: the root `Dockerfile`, serving `/models/smolvla-libero.gguf` on port `5555`
+  with CUDA/CDI GPU access enabled by default.
+- `client`: `eval/Dockerfile.client`, with `/tmp/smolvla-models` mounted at `/models` and
+  `/tmp/libero_outputs` mounted for videos and summaries.
+
+From the repository root:
+
+```bash
+# Build the client first so its Hugging Face CLI can populate the Compose model mount.
+docker compose -f eval/docker-compose.yml build client
+docker compose -f eval/docker-compose.yml run --no-deps --rm client \
+  hf download vrfai/smolvla-libero-gguf --local-dir /models
+
+# Build both images and start the SmolVLA server in the background.
+docker compose -f eval/docker-compose.yml build
+docker compose -f eval/docker-compose.yml up -d server
+
+# Run one LIBERO episode from the client container.
+docker compose -f eval/docker-compose.yml run --rm client \
+  python eval/client/run_sim_client_direct.py \
+    --task libero_object \
+    --task-id 0 \
+    --n-episodes 1 \
+    --output-dir /tmp/libero_outputs \
+    --arch smolvla \
+    --vla-addr tcp://server:5555
+```
+
+The server is exposed on `localhost:5555` from the host and as `tcp://server:5555` inside the
+Compose network. Results are written on the host under `/tmp/libero_outputs`. Stop the stack with
+`docker compose -f eval/docker-compose.yml down`.
 
 ## Reports
 

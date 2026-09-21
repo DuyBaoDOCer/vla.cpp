@@ -135,8 +135,12 @@ echo "[config] MODEL=${MODEL}"
 
 cd "${REPO_ROOT}"
 
-echo "[build] cmake --build build"
-cmake --build build -j"$(nproc)"
+if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+    echo "[build] skipped (SKIP_BUILD=1)"
+else
+    echo "[build] cmake --build build"
+    cmake --build build -j"$(nproc)"
+fi
 
 if [[ ! -x "${SERVER_BIN}" ]]; then
     echo "ERROR: ${SERVER_BIN} not found after build." >&2
@@ -294,9 +298,10 @@ run_model() {
         client_extra+=(--stats-json "${stats_json}")
     fi
 
+    # BF16 weights are the shipping default now, and are what every published
+    # GR00T success rate was measured under; passed explicitly so the log records it.
     if [[ "${arch}" == gr00t_n1_5 || "${arch}" == gr00t_n1_6 || "${arch}" == gr00t_n1_7 ]]; then
-        export VLA_GR00T_BF16_WEIGHTS="${VLA_GR00T_BF16_WEIGHTS:-1}"
-        echo "[${arch}] VLA_GR00T_BF16_WEIGHTS=${VLA_GR00T_BF16_WEIGHTS}"
+        server_args+=(--weight-dtype "${WEIGHT_DTYPE:-bf16}")
     fi
     if [[ -n "${_USER_VLA_GR00T_EMBODIMENT}" ]]; then
         export VLA_GR00T_EMBODIMENT="${_USER_VLA_GR00T_EMBODIMENT}"

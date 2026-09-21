@@ -13,23 +13,22 @@
 // limitations under the License.
 
 // One-shot action prediction from the command line. Loads a model, decodes an
-// image plus an already-tokenized instruction, runs one predict(), and prints
-// the action chunk. No server, no simulator. Tokenization stays in the Python
-// client, so language is passed as token ids here.
+// image plus an instruction, runs one predict(), and prints the action chunk.
+// No server, no simulator. Most archs have no tokenizer in the C++ core, so
+// --text shells out to scripts/tokenize_prompt.py; --tokens takes ids directly.
+// Octo is the exception: its T5 SentencePiece vocab is baked into the GGUF, so
+// --text is tokenized in-process (no Python) and also yields the attention mask
+// that Octo's predict() requires.
 //
 //   vla-cli [--mmproj m.gguf] --ckpt c.gguf --image img.jpg [--image img2.jpg]
-//           --tokens id,id,... [--state f,f,...] [--pretty]
-//
-// --model octo is the exception: Octo tokenizes its own instruction text
-// in-process (TIP-007/M6), so that path takes raw images + text instead:
-//
-//   vla-cli --model octo --ckpt octo-small-1.5-f32.gguf
-//           --image-primary p.png --image-wrist w.png --instruction "..."
-//           [--normalized] [--pretty]
+//           (--text "pick up the bowl" | --tokens id,id,...) [--state f,f,...] [--pretty]
 
 #include "arch.h"
 #include "model.h"
+#include "serving/hf_fetch.h"
+#ifdef VLA_USE_OCTO
 #include "models/octo.h"
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_STATIC
@@ -58,15 +57,23 @@ bool parse_ints(const std::string & s, std::vector<int32_t> & out) {
     out.clear();
     size_t i = 0;
     while (i < s.size()) {
-        while (i < s.size() && (s[i] == ',' || s[i] == ' ')) ++i;
-        if (i >= s.size()) break;
+        while (i < s.size() && (s[i] == ',' || s[i] == ' '))
+            ++i;
+        if (i >= s.size())
+            break;
         errno = 0;
         char * e = nullptr;
-        long long x = std::strtoll(s.c_str() + i, &e, 10);
-        if (e == s.c_str() + i) { std::fprintf(stderr, "vla-cli: bad token near '%s'\n", s.c_str() + i); return false; }
-        if (errno == ERANGE || x < INT32_MIN || x > INT32_MAX) { std::fprintf(stderr, "vla-cli: token %lld out of int32 range\n", x); return false; }
+        long long x = std::strtoll(s.c_str()+i, &e, 10);
+        if (e == s.c_str()+i) {
+            std::fprintf(stderr, "vla-cli: bad token near '%s'\n", s.c_str()+i);
+            return false;
+        }
+        if (errno == ERANGE || x < INT32_MIN || x > INT32_MAX) {
+            std::fprintf(stderr, "vla-cli: token %lld out of int32 range\n", x);
+            return false;
+        }
         out.push_back((int32_t) x);
-        i = (size_t) (e - s.c_str());
+        i = (size_t) (e-s.c_str());
     }
     return true;
 }
@@ -76,14 +83,22 @@ bool parse_floats(const std::string & s, std::vector<float> & out) {
     out.clear();
     size_t i = 0;
     while (i < s.size()) {
-        while (i < s.size() && (s[i] == ',' || s[i] == ' ')) ++i;
-        if (i >= s.size()) break;
+        while (i < s.size() && (s[i] == ',' || s[i] == ' '))
+            ++i;
+        if (i >= s.size())
+            break;
         char * e = nullptr;
-        float x = std::strtof(s.c_str() + i, &e);
-        if (e == s.c_str() + i) { std::fprintf(stderr, "vla-cli: bad number near '%s'\n", s.c_str() + i); return false; }
-        if (!std::isfinite(x)) { std::fprintf(stderr, "vla-cli: non-finite value in --state\n"); return false; }
+        float x = std::strtof(s.c_str()+i, &e);
+        if (e == s.c_str()+i) {
+            std::fprintf(stderr, "vla-cli: bad number near '%s'\n", s.c_str()+i);
+            return false;
+        }
+        if (!std::isfinite(x)) {
+            std::fprintf(stderr, "vla-cli: non-finite value in --state\n");
+            return false;
+        }
         out.push_back(x);
-        i = (size_t) (e - s.c_str());
+        i = (size_t) (e-s.c_str());
     }
     return true;
 }
@@ -96,116 +111,206 @@ bool load_image(const char * path, std::vector<uint8_t> & buf, int & w, int & h)
         std::fprintf(stderr, "vla-cli: cannot load image %s: %s\n", path, stbi_failure_reason());
         return false;
     }
-    buf.assign(px, px + size_t(3) * w * h);
+    buf.assign(px, px+size_t(3)*w * h);
     stbi_image_free(px);
     return true;
 }
 
+const char * arch_slug(Arch a) {
+    switch (a) {
+        case Arch::SMOLVLA:     return "smolvla";
+        case Arch::PI0:         return "pi0";
+        case Arch::PI05:        return "pi05";
+        case Arch::EVO1:        return "evo1";
+        case Arch::GR00T_N1_5:  return "gr00t_n1_5";
+        case Arch::GR00T_N1_6:  return "gr00t_n1_6";
+        case Arch::GR00T_N1_7:  return "gr00t_n1_7";
+        case Arch::BITVLA:      return "bitvla";
+        case Arch::VLA_ADAPTER: return "vla_adapter";
+        case Arch::OPENVLA_OFT: return "openvla_oft";
+        case Arch::VLA_JEPA:    return "vla_jepa";
+        case Arch::OCTO:        return "octo";
+    }
+    return "";
+}
+
+// The instruction reaches a shell command, so keep it to plain prose.
+bool text_ok(const std::string & s) {
+    if (s.empty() || s.size() > 512)
+        return false;
+    for (const char c : s) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == ' ' || c == '.' || c == ',' ||
+                        c == '-' || c == '_' || c == '\'';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+// Ask scripts/tokenize_prompt.py for the ids, using the tokenizer the arch was
+// trained with. Returns "" and explains on stderr.
+std::string tokenize_text(const std::string & ckpt, const std::string & text) {
+    Arch arch;
+    if (!detect_arch_from_ckpt(ckpt, &arch)) {
+        std::fprintf(stderr, "vla-cli: cannot detect the arch of %s for --text\n", ckpt.c_str());
+        return "";
+    }
+    if (!text_ok(text)) {
+        std::fprintf(stderr, "vla-cli: --text takes plain prose (letters, digits, space . , - _ ')\n");
+        return "";
+    }
+    std::string esc;
+    for (const char c : text) {
+        if (c == '\'')
+            esc += "'\\''";
+        else
+            esc += c;
+    }
+    // Env first so a packaged binary can point at its own copy of the script.
+    const char * env = std::getenv("VLA_TOKENIZE_SCRIPT");
+    const std::string script = (env && *env) ? std::string(env)
+                                             : std::string(VLA_SOURCE_DIR) + "/scripts/tokenize_prompt.py";
+    const char * py = std::getenv("VLA_PYTHON");
+    const std::string interp = (py && *py) ? std::string(py) : std::string("python3");
+    const std::string cmd = "'" + interp + "' '" + script + "' --arch " + arch_slug(arch) +
+                            " --text '" + esc + "'";
+
+    FILE * fp = popen(cmd.c_str(), "r");
+    if (!fp) {
+        std::fprintf(stderr, "vla-cli: cannot run %s\n", cmd.c_str());
+        return "";
+    }
+    std::string out;
+    char buf[4096];
+    while (std::fgets(buf, sizeof(buf), fp))
+        out += buf;
+    if (pclose(fp) != 0) {
+        std::fprintf(stderr,
+                     "vla-cli: tokenizing failed. Install the client extras with\n"
+                     "         pip install -e \".[client]\"\n"
+                     "         (VLA_PYTHON selects a different interpreter)\n");
+        return "";
+    }
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
+        out.pop_back();
+    return out;
+}
+
 void usage(const char * prog) {
     std::fprintf(stderr,
-        "usage: %s [--mmproj m.gguf] --ckpt c.gguf --image img.jpg [--image ...]\n"
-        "          --tokens id,id,... [--state f,f,...] [--pretty]\n"
+        "usage: %s [--mmproj m.gguf] (--ckpt c.gguf | -hf user/repo) --image img.jpg [--image ...]\n"
+        "          (--text \"...\" | --tokens id,id,...) [--state f,f,...] [--pretty]\n"
         "  --mmproj   vision-tower GGUF (SmolVLA/pi0/pi0.5); omit for baked-vision archs\n"
         "  --ckpt     model checkpoint GGUF\n"
+        "  -hf        HuggingFace repo, user/repo[:file.gguf], cached under $VLA_CACHE\n"
         "  --image    image file, repeat for multi-view (decoded via stb_image)\n"
-        "  --tokens   language token ids, comma-separated (tokenize in the client)\n"
+        "  --text     instruction; tokenized by scripts/tokenize_prompt.py (needs\n"
+        "             transformers), or in-process for Octo, whose vocab is in the GGUF\n"
+        "  --tokens   language token ids, comma-separated, if you tokenized already\n"
         "  --state    proprioception floats, comma-separated (default zeros)\n"
-        "  --pretty   print one action row (max_action_dim values) per line\n"
-        "\n"
-        "octo mode (in-process SentencePiece tokenization, no --tokens needed):\n"
-        "  %s --model octo --ckpt octo-small-1.5-f32.gguf\n"
-        "     --image-primary p.png --image-wrist w.png --instruction \"...\" [--normalized] [--pretty]\n"
-        "  --model         octo (auto-detected from --ckpt if omitted)\n"
-        "  --image-primary primary camera view, single current frame\n"
-        "  --image-wrist   wrist camera view, single current frame\n"
-        "  --instruction   raw language instruction text\n"
-        "  --normalized    print the verified normalized action instead of the\n"
-        "                  un-normalized (world-unit, NOT verified vs golden -- M8) default\n",
-        prog, prog);
+        "  --pretty   print one action row (max_action_dim values) per line\n",
+        prog);
 }
 
 }  // namespace
 
 int main(int argc, char ** argv) {
-    std::string mmproj, ckpt, tokens_s, state_s;
+    std::string mmproj, ckpt, hf, tokens_s, state_s, text_s;
     std::vector<std::string> image_paths;
     bool pretty = false;
-    std::string model_flag, image_primary, image_wrist, instruction;
-    bool normalized = false;
 
-    for (int i = 1; i < argc; ++i) {
+    for (int i=1; i<argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char * name) -> const char * {
-            if (i + 1 >= argc) { std::fprintf(stderr, "vla-cli: %s needs a value\n", name); std::exit(1); }
+            if (i+1 >= argc) {
+                std::fprintf(stderr, "vla-cli: %s needs a value\n", name);
+                std::exit(1);
+            }
             return argv[++i];
         };
-        if      (a == "--mmproj")  mmproj = need("--mmproj");
+        if      (a == "--mmproj")
+            mmproj = need("--mmproj");
         else if (a == "--ckpt")    ckpt = need("--ckpt");
+        else if (a == "-hf")       hf   = need("-hf");
         else if (a == "--image")   image_paths.push_back(need("--image"));
         else if (a == "--tokens")  tokens_s = need("--tokens");
+        else if (a == "--text")    text_s = need("--text");
         else if (a == "--state")   state_s = need("--state");
         else if (a == "--pretty")  pretty = true;
-        else if (a == "--model")          model_flag   = need("--model");
-        else if (a == "--image-primary")  image_primary = need("--image-primary");
-        else if (a == "--image-wrist")    image_wrist   = need("--image-wrist");
-        else if (a == "--instruction")    instruction   = need("--instruction");
-        else if (a == "--normalized")     normalized    = true;
-        else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
-        else { std::fprintf(stderr, "vla-cli: unknown argument %s\n", a.c_str()); usage(argv[0]); return 1; }
-    }
-    if (ckpt.empty()) { usage(argv[0]); return 1; }
-
-    bool octo_mode = (model_flag == "octo");
-    if (!octo_mode && model_flag.empty() && (!image_primary.empty() || !image_wrist.empty() || !instruction.empty())) {
-        Arch arch;
-        if (detect_arch_from_ckpt(ckpt, &arch) && arch == Arch::OCTO) octo_mode = true;
-    }
-
-    if (octo_mode) {
-        if (image_primary.empty() || image_wrist.empty() || instruction.empty()) {
-            std::fprintf(stderr, "vla-cli: --model octo needs --image-primary, --image-wrist, and --instruction\n");
+        else if (a == "-h" || a == "--help") {
+            usage(argv[0]);
+            return 0;
+        }
+        else {
+            std::fprintf(stderr, "vla-cli: unknown argument %s\n", a.c_str());
             usage(argv[0]);
             return 1;
         }
-        std::vector<uint8_t> pbuf, wbuf;
-        int pw = 0, ph = 0, ww = 0, wh = 0;
-        if (!load_image(image_primary.c_str(), pbuf, pw, ph)) return 1;
-        if (!load_image(image_wrist.c_str(), wbuf, ww, wh)) return 1;
-
-        OctoCliAction result;
-        if (!octo_predict_from_images(ckpt, pbuf.data(), pw, ph, wbuf.data(), ww, wh, instruction, result)) {
-            std::fprintf(stderr, "vla-cli: octo predict failed\n");
-            return 2;
-        }
-        const std::vector<float> & act = normalized ? result.normalized : result.unnormalized;
-        if (!normalized) {
-            std::fprintf(stderr,
-                "vla-cli: printing UN-normalized action (world units, via octo.dataset_statistics "
-                "bridge_dataset); this path is NOT verified against golden yet (M8). "
-                "Pass --normalized for the verified normalized action.\n");
-        }
-        constexpr int64_t cols = 7;
-        if (pretty) {
-            for (size_t i = 0; i < act.size(); ++i)
-                std::printf("%.6g%c", act[i], ((int64_t) (i + 1) % cols == 0) ? '\n' : ' ');
-        } else {
-            std::printf("action_len=%zu\n", act.size());
-            for (float x : act) std::printf("%.9g\n", x);
-        }
-        std::fflush(stdout);
-        return 0;
     }
-
-    if (image_paths.empty() || tokens_s.empty()) { usage(argv[0]); return 1; }
-
+    if (!hf.empty()) {
+        if (!ckpt.empty()) {
+            std::fprintf(stderr, "vla-cli: pass --ckpt or -hf, not both\n");
+            return 1;
+        }
+        ckpt = vla::hf_resolve(hf);
+        if (ckpt.empty())
+            return 1;
+    }
+    if (ckpt.empty() || image_paths.empty() || (tokens_s.empty() && text_s.empty())) {
+        usage(argv[0]);
+        return 1;
+    }
+    if (!tokens_s.empty() && !text_s.empty()) {
+        std::fprintf(stderr, "vla-cli: pass --text or --tokens, not both\n");
+        return 1;
+    }
     // Validate the cheap args before loading the model.
     std::vector<int32_t> lang;
+    std::vector<int32_t> attn;   // Octo only; empty leaves Inputs::attention_mask null.
     std::vector<float>   state;
-    if (!parse_ints(tokens_s, lang) || !parse_floats(state_s, state)) return 1;
-    if (lang.empty()) { std::fprintf(stderr, "vla-cli: --tokens parsed to nothing\n"); return 1; }
+
+    Arch arch;
+    const bool have_arch = detect_arch_from_ckpt(ckpt, &arch);
+#ifdef VLA_USE_OCTO
+    if (have_arch && arch == Arch::OCTO) {
+        // Octo's T5 encoder needs the real padding mask, which ids alone do not
+        // carry, and its tokenizer ships inside the checkpoint -- so --text is
+        // both the supported and the cheaper route here.
+        if (text_s.empty()) {
+            std::fprintf(stderr, "vla-cli: octo needs --text (its predict() needs the attention "
+                                 "mask, which --tokens cannot express)\n");
+            return 1;
+        }
+        if (!octo_tokenize_text(ckpt, text_s, lang, attn)) {
+            std::fprintf(stderr, "vla-cli: octo tokenization failed\n");
+            return 1;
+        }
+    } else
+#endif
+    {
+        (void) have_arch;
+        if (!text_s.empty()) {
+            tokens_s = tokenize_text(ckpt, text_s);
+            if (tokens_s.empty())
+                return 1;
+            std::fprintf(stderr, "vla-cli: --text tokenized to %s\n", tokens_s.c_str());
+        }
+        if (!parse_ints(tokens_s, lang))
+            return 1;
+    }
+    if (!parse_floats(state_s, state))
+        return 1;
+    if (lang.empty()) {
+        std::fprintf(stderr, "vla-cli: --tokens parsed to nothing\n");
+        return 1;
+    }
 
     Model * m = model_load(mmproj, ckpt, "");
-    if (!m) { std::fprintf(stderr, "vla-cli: model_load failed\n"); return 1; }
+    if (!m) {
+        std::fprintf(stderr, "vla-cli: model_load failed\n");
+        return 1;
+    }
     const Config & cfg = model_config(m);
 
     if (!state.empty() && (int64_t) state.size() != cfg.max_state_dim)
@@ -215,9 +320,12 @@ int main(int argc, char ** argv) {
 
     std::vector<std::vector<uint8_t>> imgbuf(image_paths.size());
     std::vector<ImageView>            views(image_paths.size());
-    for (size_t v = 0; v < image_paths.size(); ++v) {
+    for (size_t v=0; v<image_paths.size(); ++v) {
         int w = 0, h = 0;
-        if (!load_image(image_paths[v].c_str(), imgbuf[v], w, h)) { model_free(m); return 1; }
+        if (!load_image(image_paths[v].c_str(), imgbuf[v], w, h)) {
+            model_free(m);
+            return 1;
+        }
         views[v] = ImageView{ imgbuf[v].data(), w, h, PixelFormat::U8 };
     }
 
@@ -226,19 +334,28 @@ int main(int argc, char ** argv) {
     in.n_images    = (int) views.size();
     in.lang_tokens = lang.data();
     in.n_lang      = (int) lang.size();
+    if (!attn.empty()) {
+        in.attention_mask   = attn.data();
+        in.attention_mask_n = (int) attn.size();
+    }
     in.state       = state.data();
     in.noise       = nullptr;  // predict() samples N(0,1) when omitted
 
     std::vector<float> act = predict(m, in);
-    if (act.empty()) { std::fprintf(stderr, "vla-cli: predict failed\n"); model_free(m); return 2; }
+    if (act.empty()) {
+        std::fprintf(stderr, "vla-cli: predict failed\n");
+        model_free(m);
+        return 2;
+    }
 
     const int64_t cols = cfg.max_action_dim > 0 ? cfg.max_action_dim : 1;
     if (pretty) {
-        for (size_t i = 0; i < act.size(); ++i)
-            std::printf("%.6g%c", act[i], ((int64_t) (i + 1) % cols == 0) ? '\n' : ' ');
+        for (size_t i=0; i<act.size(); ++i)
+            std::printf("%.6g%c", act[i], ((int64_t) (i+1)%cols == 0) ? '\n' : ' ');
     } else {
         std::printf("action_len=%zu\n", act.size());
-        for (float x : act) std::printf("%.9g\n", x);
+        for (float x : act)
+            std::printf("%.9g\n", x);
     }
     std::fflush(stdout);
 

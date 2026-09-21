@@ -2,9 +2,9 @@
 
 A minimal **streaming image+text chat** client for `vlm-server`, the llama.cpp +
 libmtmd chat runtime (`src/vlm/engine.cpp`) behind a ZMQ daemon. Send text and
-images, get a streamed reply. The design rationale lives in
-[docs/VLM-SERVER.md](../../docs/VLM-SERVER.md); this README is how to **run** it,
-plus the validation numbers for the SmolVLM2-500M-Instruct setup.
+images, get a streamed reply. The layering is sketched in
+[docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md); this README is how to **run**
+it, plus the validation numbers for the SmolVLM2-500M-Instruct setup.
 
 ```
 examples/chat/
@@ -46,7 +46,7 @@ Convert:
 SRC=/tmp/smolvlm2-500m-instruct
 OUT=~/data/$USER/smolvlm2-500m-instruct-gguf
 mkdir -p "$OUT"
-CONV="PYTHONPATH=third_party/llama.cpp/gguf-py python3 third_party/llama.cpp/convert_hf_to_gguf.py"
+CONV="PYTHONPATH=build/_deps/llama-src/gguf-py python3 build/_deps/llama-src/convert_hf_to_gguf.py"
 
 # text LM  ->  smolvlm2-500m-instruct-f16.gguf  (819 MB)
 eval $CONV "$SRC" --outtype f16 \
@@ -61,13 +61,16 @@ eval $CONV "$SRC" --mmproj \
 The LM conversion resolves the hparams (hidden 960, ff 2560, 15 heads / 5 KV,
 rope θ 1e5) and bakes the SmolVLM2 chat template into the GGUF KV store; the
 `--mmproj` pass writes 198 vision tensors. Sanity-check the pair with
-`llama-mtmd-cli`:
+`llama-mtmd-cli`. It is not part of the default build, so ask for it by name
+first:
 
 ```bash
+cmake --build build-cuda --target llama-mtmd-cli
+
 ./build-cuda/bin/llama-mtmd-cli \
     -m "$OUT/smolvlm2-500m-instruct-f16.gguf" \
     --mmproj "$OUT/mmproj-smolvlm2-500m-instruct-f16.gguf" \
-    --image third_party/llama.cpp/tools/mtmd/test-1.jpeg -p "Describe this image." --temp 0
+    --image build/_deps/llama-src/tools/mtmd/test-1.jpeg -p "Describe this image." --temp 0
 ```
 
 > Shortcut: `HuggingFaceTB/SmolVLM2-500M-Video-Instruct` has **byte-identical
@@ -120,7 +123,7 @@ python examples/chat/vlm_chat_client.py --addr tcp://localhost:5567
 
 ```bash
 python examples/chat/vlm_chat_client.py --once \
-    --image third_party/llama.cpp/tools/mtmd/test-1.jpeg \
+    --image build/_deps/llama-src/tools/mtmd/test-1.jpeg \
     -p "Describe this image in detail." -n 200 --temp 0
 ```
 

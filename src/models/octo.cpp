@@ -3,19 +3,15 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 
 #include "arch.h"
+#include "backend.h"
+#include "gguf_reader.h"
 #include "model.h"
-#include "models/gguf_reader.h"
 #include "models/octo.h"
+#include "modules/preprocess.h"
+#include "scratch_ctx.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
 #include "gguf.h"
 
 #include "nlohmann/json.hpp"
@@ -51,21 +47,68 @@ constexpr int kMaxHorizon = 10;
 // is 7-dim, so this is fixed regardless of checkpoint.
 constexpr int kProprioTokens = 7;
 
-// Every forward stage below builds a throwaway graph. Both halves of that are expensive to
-// redo per frame: ggml_init() malloc()s its whole mem_size even with no_alloc (the graph and
-// tensor metadata are the only things that live there), and ggml_gallocr_new()/_free()
-// reallocates the backend compute buffer instead of reusing one sized for the same graph.
-// OctoRuntime keeps both alive for the model's lifetime: one host arena the stages take turns
-// borrowing (they never nest), and one allocator per stage so each keeps its own steady-state
-// buffer.
-enum class OctoStage { OBS_PRIMARY, OBS_WRIST, PROPRIO, T5, LANGUAGE, TRANSFORMER, SCORE_ACTOR, L1_HEAD, COUNT };
-
+// Per-model inference state that outlives a single predict(): a graph cache per stage
+// (scratch_ctx.h keeps the context, the allocator and the built graph, so ggml-cuda can
+// capture and replay a stable node list), a name index over the resident weights, and the
+// two results that do not depend on anything a frame changes.
 struct OctoRuntime {
     ggml_backend_t backend = nullptr;   ///< Not owned.
     ggml_context * ctx_w = nullptr;     ///< Resident weights, not owned.
-    std::vector<uint8_t> arena;
-    std::array<ggml_gallocr_t, (size_t) OctoStage::COUNT> allocs{};
     std::unordered_map<std::string, ggml_tensor *> by_name;
+
+    // Image tokenizer, one cache per camera: the views differ in side and token count, so
+    // they cannot share a graph.
+    struct ObsKey {
+        int side = -1, n_tok = -1, steps = -1;
+        bool operator==(const ObsKey& o) const { return side == o.side && n_tok == o.n_tok && steps == o.steps; }
+    };
+    struct ObsIO { ggml_tensor * input = nullptr, * rows = nullptr, * pos = nullptr; };
+    graph_cache<ObsKey, ObsIO> obs_primary, obs_wrist;
+
+    struct ProprioKey {
+        int in_dim = -1, steps = -1;
+        bool operator==(const ProprioKey& o) const { return in_dim == o.in_dim && steps == o.steps; }
+    };
+    struct ProprioIO { ggml_tensor * tokens = nullptr, * rows = nullptr, * pos = nullptr; };
+    graph_cache<ProprioKey, ProprioIO> proprio;
+
+    struct T5Key {
+        int seq = -1;
+        bool operator==(const T5Key& o) const { return seq == o.seq; }
+    };
+    struct T5IO { ggml_tensor * ids = nullptr, * bucket = nullptr, * padmask = nullptr, * out = nullptr; };
+    graph_cache<T5Key, T5IO> t5;
+
+    struct LangKey {
+        int steps = -1;
+        bool operator==(const LangKey& o) const { return steps == o.steps; }
+    };
+    struct LangIO { ggml_tensor * in = nullptr, * pos = nullptr, * repeated = nullptr; };
+    graph_cache<LangKey, LangIO> language;
+
+    struct BtKey {
+        int seq = -1, n_readout = -1;
+        bool operator==(const BtKey& o) const { return seq == o.seq && n_readout == o.n_readout; }
+    };
+    struct BtIO { ggml_tensor * input = nullptr, * mask = nullptr, * readout_idx = nullptr, * out = nullptr; };
+    graph_cache<BtKey, BtIO> transformer;
+
+    // The whole reverse process lives in one graph. The steps are sequentially dependent so
+    // they cannot be batched, but with the graph cached the build cost is paid once and a
+    // frame then costs one submission instead of twenty.
+    struct DiffKey {
+        int width = -1, action = -1, steps = -1;
+        bool operator==(const DiffKey& o) const { return width == o.width && action == o.action && steps == o.steps; }
+    };
+    struct DiffIO { ggml_tensor * obs = nullptr, * x0 = nullptr, * z = nullptr, * times = nullptr, * out = nullptr; };
+    graph_cache<DiffKey, DiffIO> diffusion;
+
+    struct L1Key {
+        int width = -1, action = -1;
+        bool operator==(const L1Key& o) const { return width == o.width && action == o.action; }
+    };
+    struct L1IO { ggml_tensor * readout = nullptr, * out = nullptr; };
+    graph_cache<L1Key, L1IO> l1_head;
 
     // The T5 encoder and the projection after it depend only on the instruction's token ids
     // and attention mask, which stay fixed for as long as the robot is pursuing one task --
@@ -78,9 +121,8 @@ struct OctoRuntime {
 
     // octo.dataset_statistics is a JSON blob in the GGUF metadata (~25 datasets wide for the
     // bridge pretrain checkpoint). Parsing it per request, twice, to read 21 floats is pure
-    // overhead -- and it defers a malformed-metadata failure to inference time. Resolved once,
-    // on the first call that needs it, and keyed on the dataset name in case a caller asks
-    // for a different block.
+    // overhead -- and it defers a malformed-metadata failure to inference time. Resolved once
+    // and keyed on the dataset name, in case a caller asks for a different block.
     struct ActionStats {
         std::vector<float> mean, stdv;
         std::vector<uint8_t> mask;
@@ -94,15 +136,11 @@ struct OctoRuntime {
     ProprioStats proprio_stats;
     bool has_proprio_stats = false;
 
-    // Graph metadata only (no_alloc), so this is far more than any stage needs.
-    static constexpr size_t kArenaBytes = 32u * 1024 * 1024;
-
     void init(ggml_backend_t b, ggml_context * w) {
         backend = b;
         ctx_w = w;
-        arena.resize(kArenaBytes);
         // ggml_get_tensor is a linear strcmp scan over every resident tensor, and building
-        // the stage graphs looks up a few hundred weights by name per frame. Index them once.
+        // the stage graphs looks up a few hundred weights by name. Index them once.
         by_name.clear();
         for (ggml_tensor * t = ggml_get_first_tensor(w); t; t = ggml_get_next_tensor(w, t)) {
             by_name.emplace(t->name, t);
@@ -116,24 +154,30 @@ struct OctoRuntime {
         }
         return it->second;
     }
-    ggml_context * open_ctx() {
-        ggml_init_params gp = {arena.size(), arena.data(), /*no_alloc=*/true};
-        return ggml_init(gp);
-    }
-    ggml_gallocr_t alloc(OctoStage stage) {
-        ggml_gallocr_t& a = allocs[(size_t) stage];
-        if (!a) a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        return a;
-    }
-    // Must run before the backend it allocated from is freed.
+    /// Must run before the backend the caches allocated from is freed.
     void reset() {
-        for (ggml_gallocr_t& a : allocs) {
-            if (a) ggml_gallocr_free(a);
-            a = nullptr;
-        }
+        obs_primary.release();
+        obs_wrist.release();
+        proprio.release();
+        t5.release();
+        language.release();
+        transformer.release();
+        diffusion.release();
+        l1_head.release();
     }
     ~OctoRuntime() { reset(); }
 };
+
+// Relabels duplicate node names for ggml-openvino (a no-op elsewhere) and computes.
+static bool octo_compute(OctoRuntime& rt, ggml_cgraph * gf, const char * what) {
+    graph_unique_names(gf);
+    const ggml_status st = ggml_backend_graph_compute(rt.backend, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "vla(octo): %s graph compute failed (%d)\n", what, (int) st);
+        return false;
+    }
+    return true;
+}
 
 struct OctoModelArch : public ModelArchBase {
     OctoModelArch() : ModelArchBase(Arch::OCTO) {}
@@ -383,7 +427,7 @@ bool load_all_tensors(OctoModelArch& m, gguf_reader& g) {
         m.tensors.push_back(t);
     }
 
-    m.weight_buf = ggml_backend_alloc_ctx_tensors(m.ctx_weights, m.backend);
+    m.weight_buf = alloc_weights(m.ctx_weights, m.backend);
     if (!m.weight_buf) {
         std::fprintf(stderr, "vla(octo): ggml_backend_alloc_ctx_tensors failed\n");
         return false;
@@ -402,34 +446,6 @@ bool load_all_tensors(OctoModelArch& m, gguf_reader& g) {
     return true;
 }
 
-// TIP-ND1-B: shared backend-selection logic (CUDA -> Metal -> CPU fallback), factored out of
-// octo_create so every caller that needs its own resident model load (octo_create itself,
-// octo_dump_tokenizer_case_resident, octo_predict_from_images, octo_free_sample_case) shares
-// the identical selection order instead of re-duplicating it. `log_prefix` distinguishes the
-// log lines of the non-octo_create callers (e.g. "[dump] ") from the live server's.
-static ggml_backend_t octo_select_backend(int n_threads, const char * log_prefix) {
-    ggml_backend_t backend = nullptr;
-#ifdef GGML_USE_CUDA
-    backend = ggml_backend_cuda_init(0);
-    if (backend) std::printf("vla(octo): %sbackend = CUDA (device 0)\n", log_prefix);
-    else         std::fprintf(stderr, "vla(octo): %sggml_backend_cuda_init failed; falling back to CPU\n", log_prefix);
-#elif defined(GGML_USE_METAL)
-    backend = ggml_backend_metal_init();
-    if (backend) std::printf("vla(octo): %sbackend = Metal\n", log_prefix);
-    else         std::fprintf(stderr, "vla(octo): %sggml_backend_metal_init failed; falling back to CPU\n", log_prefix);
-#endif
-    if (!backend) {
-        backend = ggml_backend_cpu_init();
-        if (!backend) {
-            std::fprintf(stderr, "vla(octo): %sggml_backend_cpu_init failed\n", log_prefix);
-            return nullptr;
-        }
-        ggml_backend_cpu_set_n_threads(backend, n_threads);
-        std::printf("vla(octo): %sbackend = CPU (%d threads)\n", log_prefix, n_threads);
-    }
-    return backend;
-}
-
 // Host-side copy of a resident weight tensor's data, for the handful of weights that need a
 // per-call CPU-side transform (standardize_conv_weight, expand_1d, pos-embed slicing) before
 // they become graph operands -- those transforms are unchanged, just fed from the resident
@@ -442,136 +458,120 @@ static std::vector<float> tensor_to_vec(const ggml_tensor * t) {
     return out;
 }
 
-struct NpyU8 {
-    std::vector<int64_t> shape;
-    std::vector<uint8_t> data;
-};
-
 // SmallStem16 image tokenizer for one camera view: 4 standardized-conv + GroupNorm + ReLU
 // stages (stride 2 each, so side/16 x side/16 cells), a 1x1 patch embedding to 512, a linear
 // projection to the 384-wide model width, and the per-timestep position embedding.
 //
-// `obs` holds the frames for `steps` (obs.shape = {1, steps, 3, side, side}) and `task` the
-// single goal frame concatenated onto every one of them as channels 3..5. Every weight is
-// referenced straight out of the resident context -- reshaped where the graph needs a
-// different rank, never copied through host memory.
+// `obs` holds the normalized CHW frames for `steps` and `task` the single goal frame,
+// concatenated onto every one of them as channels 3..5. Every weight is referenced straight
+// out of the resident context -- reshaped where the graph needs a different rank, never
+// copied through host memory.
 static bool run_obs_tokenizer_graph(OctoRuntime& rt,
-                                    OctoStage stage,
+                                    graph_cache<OctoRuntime::ObsKey, OctoRuntime::ObsIO>& cache,
                                     const char * view,
-                                    const NpyU8& obs,
-                                    const NpyU8& task,
+                                    const std::vector<float>& obs,   // [steps,3,side,side] normalized
+                                    const std::vector<float>& task,  // [3,side,side] normalized
                                     int side,
                                     int n_tok,
                                     int steps,
                                     const std::vector<int32_t>& pos_rows,
                                     std::vector<float>& pos) {
-    if (obs.shape.size() != 5 || task.shape.size() != 4 ||
-        obs.shape[0] != 1 || obs.shape[1] != steps || obs.shape[2] != 3 ||
-        task.shape[0] != 1 || task.shape[1] != 3 ||
-        obs.shape[3] != side || obs.shape[4] != side ||
-        task.shape[2] != side || task.shape[3] != side) {
+    const size_t frame = (size_t) 3 * side * side;
+    if (obs.size() != frame * (size_t) steps || task.size() != frame) {
         std::fprintf(stderr, "vla(octo): unexpected input image shape for side=%d\n", side);
         return false;
     }
     if ((int) pos_rows.size() != steps) return false;
     pos.assign((size_t) steps * n_tok * 384, 0.0f);
 
-    std::vector<float> input((size_t) side * side * 6 * steps, 0.0f);
-    for (int t = 0; t < steps; ++t) {
-        for (int c = 0; c < 3; ++c) {
-            for (int yy = 0; yy < side; ++yy) {
-                for (int xx = 0; xx < side; ++xx) {
-                    const size_t oi = ((((size_t) t * 3 + c) * side + yy) * side + xx);
-                    const size_t ti = (((size_t) c * side + yy) * side + xx);
-                    input[(((size_t) t * 6 + c) * side + yy) * side + xx] = (float) obs.data[oi] / 127.5f - 1.0f;
-                    input[(((size_t) t * 6 + c + 3) * side + yy) * side + xx] = (float) task.data[ti] / 127.5f - 1.0f;
-                }
-            }
+    const OctoRuntime::ObsKey key{side, n_tok, steps};
+    const bool built = cache.ensure(rt.backend, key, (size_t) 32*1024*1024,
+                                    [&](ggml_context * C, OctoRuntime::ObsIO& io) -> ggml_cgraph * {
+        ggml_tensor * x = ggml_new_tensor_4d(C, GGML_TYPE_F32, side, side, 6, steps);
+        ggml_set_name(x, "octo.obs.input_norm");
+        ggml_set_input(x);
+        io.input = x;
+
+        char rname[160];
+        auto weight = [&](const char * suffix, int li) -> ggml_tensor * {
+            if (li < 0) std::snprintf(rname, sizeof(rname), "octo.obs.%s.%s", view, suffix);
+            else        std::snprintf(rname, sizeof(rname), "octo.obs.%s.stem.%d.%s", view, li, suffix);
+            return rt.weight(rname);
+        };
+        // conv/GroupNorm biases and scales arrive as [ch]; the graph applies them across a
+        // [w,h,ch,steps] feature map, so reshape (a view, not a copy) to [1,1,ch,1] and let
+        // ggml_add/ggml_mul broadcast.
+        auto per_channel = [&](ggml_tensor * t) {
+            return t ? ggml_reshape_4d(C, t, 1, 1, t->ne[0], 1) : nullptr;
+        };
+
+        for (int li = 0; li < 4; ++li) {
+            ggml_tensor * cw = weight("conv.weight", li);   // already standardized at load
+            ggml_tensor * cb = per_channel(weight("conv.bias", li));
+            ggml_tensor * gw = per_channel(weight("gn.weight", li));
+            ggml_tensor * gb = per_channel(weight("gn.bias", li));
+            if (!cw || !cb || !gw || !gb) return nullptr;
+
+            x = ggml_conv_2d(C, cw, x, 2, 2, 1, 1, 1, 1);
+            x = ggml_add(C, x, cb);
+            x = ggml_group_norm(C, x, 32, 1e-5f);
+            x = ggml_add(C, ggml_mul(C, x, gw), gb);
+            x = ggml_relu(C, x);
         }
-    }
 
-    ggml_context * ctx = rt.open_ctx();
-    if (!ctx) {
-        std::fprintf(stderr, "vla(octo): ggml_init(tokenizer graph ctx) failed\n");
+        ggml_tensor * pw = weight("patch_embd.weight", -1);
+        ggml_tensor * pb = per_channel(weight("patch_embd.bias", -1));
+        ggml_tensor * jw = weight("proj.weight", -1);
+        ggml_tensor * jb = weight("proj.bias", -1);
+        ggml_tensor * pos_r = weight("pos_embd", -1);
+        if (!pw || !pb || !jw || !jb || !pos_r) return nullptr;
+
+        ggml_tensor * patch = ggml_add(C, ggml_conv_2d(C, pw, x, 1, 1, 0, 0, 1, 1), pb);
+        ggml_tensor * tok = ggml_cont(C, ggml_reshape_3d(C,
+            ggml_cont(C, ggml_permute(C, patch, 1, 2, 0, 3)), 512, n_tok, steps));
+
+        // pos_r is [384, n_tok, max_horizon]; gather the rows for the timesteps actually in
+        // the sequence, which need not be the leading ones -- see OctoSeqLayout.
+        ggml_tensor * rows = ggml_new_tensor_1d(C, GGML_TYPE_I32, steps);
+        ggml_set_name(rows, "octo.obs.pos_embd.rows");
+        ggml_set_input(rows);
+        io.rows = rows;
+        ggml_tensor * pe = ggml_reshape_3d(C,
+            ggml_get_rows(C, ggml_reshape_2d(C, pos_r, 384 * n_tok, pos_r->ne[2]), rows),
+            384, n_tok, steps);
+
+        ggml_tensor * out = ggml_add(C, ggml_add(C, ggml_mul_mat(C, jw, tok), jb), pe);
+        ggml_set_name(out, "obs.tokenizer.pos");
+        ggml_set_output(out);
+        io.pos = out;
+
+        ggml_cgraph * gf = ggml_new_graph_custom(C, 8192, false);
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    });
+    if (!built) {
+        std::fprintf(stderr, "vla(octo): obs tokenizer graph build failed\n");
         return false;
     }
 
-    ggml_tensor * input_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, side, side, 6, steps);
-    ggml_set_name(input_t, "octo.obs.input_norm");
-    ggml_tensor * x = input_t;
-
-    char rname[160];
-    auto weight = [&](const char * suffix, int li) -> ggml_tensor * {
-        if (li < 0) std::snprintf(rname, sizeof(rname), "octo.obs.%s.%s", view, suffix);
-        else        std::snprintf(rname, sizeof(rname), "octo.obs.%s.stem.%d.%s", view, li, suffix);
-        return rt.weight(rname);
-    };
-    // conv/GroupNorm biases and scales arrive as [ch]; the graph applies them across a
-    // [w,h,ch,steps] feature map, so reshape (a view, not a copy) to [1,1,ch,1] and broadcast.
-    auto per_channel = [&](ggml_tensor * t) {
-        return t ? ggml_reshape_4d(ctx, t, 1, 1, t->ne[0], 1) : nullptr;
-    };
-
-    for (int li = 0; li < 4; ++li) {
-        ggml_tensor * cw = weight("conv.weight", li);   // already standardized at load
-        ggml_tensor * cb = per_channel(weight("conv.bias", li));
-        ggml_tensor * gw = per_channel(weight("gn.weight", li));
-        ggml_tensor * gb = per_channel(weight("gn.bias", li));
-        if (!cw || !cb || !gw || !gb) { ggml_free(ctx); return false; }
-
-        x = ggml_conv_2d(ctx, cw, x, 2, 2, 1, 1, 1, 1);
-        x = ggml_add(ctx, x, cb);
-        x = ggml_group_norm(ctx, x, 32, 1e-5f);
-        x = ggml_add(ctx, ggml_mul(ctx, x, gw), gb);
-        x = ggml_relu(ctx, x);
+    OctoRuntime::ObsIO& io = cache.io();
+    // The observation frame occupies channels 0..2 of each timestep, the goal frame 3..5.
+    std::vector<float> input((size_t) steps * 2 * frame);
+    for (int t = 0; t < steps; ++t) {
+        const size_t dst = (size_t) t * 2 * frame;
+        std::copy_n(obs.begin() + (ptrdiff_t) ((size_t) t * frame), frame, input.begin() + (ptrdiff_t) dst);
+        std::copy_n(task.begin(), frame, input.begin() + (ptrdiff_t) (dst + frame));
     }
-
-    ggml_tensor * pw = weight("patch_embd.weight", -1);
-    ggml_tensor * pb = per_channel(weight("patch_embd.bias", -1));
-    ggml_tensor * jw = weight("proj.weight", -1);
-    ggml_tensor * jb = weight("proj.bias", -1);
-    ggml_tensor * pos_r = weight("pos_embd", -1);
-    if (!pw || !pb || !jw || !jb || !pos_r) { ggml_free(ctx); return false; }
-
-    ggml_tensor * patch = ggml_add(ctx, ggml_conv_2d(ctx, pw, x, 1, 1, 0, 0, 1, 1), pb);
-    ggml_tensor * tok_t = ggml_cont(ctx, ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, patch, 1, 2, 0, 3)), 512, n_tok, steps));
-
-    // pos_r is [384, n_tok, max_horizon]; gather the rows for the timesteps actually in the
-    // sequence (which need not be the leading ones -- see OctoSeqLayout).
-    ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, steps);
-    ggml_set_name(rows, "octo.obs.pos_embd.rows");
-    ggml_tensor * pe = ggml_reshape_3d(ctx,
-        ggml_get_rows(ctx, ggml_reshape_2d(ctx, pos_r, 384 * n_tok, pos_r->ne[2]), rows),
-        384, n_tok, steps);
-
-    ggml_tensor * pos_t = ggml_add(ctx, ggml_add(ctx, ggml_mul_mat(ctx, jw, tok_t), jb), pe);
-    ggml_set_name(pos_t, "obs.tokenizer.pos");
-    ggml_set_output(pos_t);
-
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
-    ggml_build_forward_expand(graph, pos_t);
-    ggml_gallocr_t gallocr = rt.alloc(stage);
-    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
-        std::fprintf(stderr, "vla(octo): tokenizer ggml_gallocr_alloc_graph failed\n");
-        ggml_free(ctx);
-        return false;
-    }
-    ggml_backend_tensor_set(input_t, input.data(), 0, ggml_nbytes(input_t));
-    ggml_backend_tensor_set(rows, pos_rows.data(), 0, ggml_nbytes(rows));
-    const ggml_status st = ggml_backend_graph_compute(rt.backend, graph);
-    if (st != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "vla(octo): tokenizer ggml_backend_graph_compute failed (%d)\n", (int) st);
-        ggml_free(ctx);
-        return false;
-    }
-    ggml_backend_tensor_get(pos_t, pos.data(), 0, ggml_nbytes(pos_t));
-    ggml_free(ctx);
+    ggml_backend_tensor_set(io.input, input.data(), 0, ggml_nbytes(io.input));
+    ggml_backend_tensor_set(io.rows, pos_rows.data(), 0, ggml_nbytes(io.rows));
+    if (!octo_compute(rt, cache.graph(), "obs tokenizer")) return false;
+    ggml_backend_tensor_get(io.pos, pos.data(), 0, ggml_nbytes(io.pos));
     return true;
 }
 
-// LowdimObsTokenizerPt(obs_keys=["proprio"]): one token per state dimension. p_norm (already
-// z-scored against the checkpoint's proprio stats by the caller) either feeds the shared
-// Linear(1,384) directly (in_dim=1, discretize=False) or is bucketed against
+// LowdimObsTokenizerPt(obs_keys=["proprio"]) forward: one token per state dimension. p_norm
+// (already z-scored against the checkpoint's proprio stats by the caller) either feeds the
+// shared Linear(1,384) directly (in_dim=1, discretize=False) or is bucketed against
 // octo.obs.proprio.bin_thresholds into a one-hot(256) first (in_dim=256, discretize=True).
 // Both converge on the same [in_dim,7,steps] -> [384,7,steps] graph once tokens_in is built.
 static bool run_proprio_tokenizer_graph(OctoRuntime& rt,
@@ -589,18 +589,13 @@ static bool run_proprio_tokenizer_graph(OctoRuntime& rt,
     }
     pos_out.assign((size_t) steps * n_dims * 384, 0.0f);
 
-    ggml_tensor * proj_w_r = rt.weight("octo.obs.proprio.proj.weight");
-    ggml_tensor * proj_b_r = rt.weight("octo.obs.proprio.proj.bias");
-    ggml_tensor * pos_r = rt.weight("octo.obs.proprio.pos_embd");
-    if (!proj_w_r || !proj_b_r || !pos_r) return false;
-
     std::vector<float> tokens_in((size_t) in_dim * n_dims * steps, 0.0f);
     if (in_dim == 1) {
         // Continuous: the token IS the z-scored scalar.
         for (size_t i = 0; i < proprio_norm.size(); ++i) tokens_in[i] = proprio_norm[i];
     } else {
-        // BinTokenizerPt: torch.bucketize(x, boundaries) -- index = count of boundaries <= x --
-        // then one-hot. No checkpoint observed so far sets discretize=True; implemented per spec.
+        // BinTokenizerPt: torch.bucketize(x, boundaries) -- index = count of boundaries <= x
+        // -- then one-hot. No checkpoint seen so far sets discretize=True; per spec.
         ggml_tensor * thresholds_r = rt.weight("octo.obs.proprio.bin_thresholds");
         if (!thresholds_r) return false;
         const std::vector<float> thresholds = tensor_to_vec(thresholds_r);
@@ -616,44 +611,49 @@ static bool run_proprio_tokenizer_graph(OctoRuntime& rt,
         }
     }
 
-    if (pos_r->ne[2] < steps) {
-        std::fprintf(stderr, "vla(octo): octo.obs.proprio.pos_embd too small for %d timesteps\n", steps);
+    const OctoRuntime::ProprioKey key{in_dim, steps};
+    const bool built = rt.proprio.ensure(rt.backend, key, (size_t) 4*1024*1024,
+                                         [&](ggml_context * C, OctoRuntime::ProprioIO& io) -> ggml_cgraph * {
+        ggml_tensor * proj_w = rt.weight("octo.obs.proprio.proj.weight");
+        ggml_tensor * proj_b = rt.weight("octo.obs.proprio.proj.bias");
+        ggml_tensor * pos_r  = rt.weight("octo.obs.proprio.pos_embd");
+        if (!proj_w || !proj_b || !pos_r) return nullptr;
+        if (pos_r->ne[2] < steps) {
+            std::fprintf(stderr, "vla(octo): octo.obs.proprio.pos_embd too small for %d timesteps\n", steps);
+            return nullptr;
+        }
+
+        ggml_tensor * x = ggml_new_tensor_3d(C, GGML_TYPE_F32, in_dim, n_dims, steps);
+        ggml_set_name(x, "octo.obs.proprio.tokens_in");
+        ggml_set_input(x);
+        io.tokens = x;
+        ggml_tensor * rows = ggml_new_tensor_1d(C, GGML_TYPE_I32, steps);
+        ggml_set_name(rows, "octo.obs.proprio.pos_embd.rows");
+        ggml_set_input(rows);
+        io.rows = rows;
+
+        ggml_tensor * pe = ggml_reshape_3d(C,
+            ggml_get_rows(C, ggml_reshape_2d(C, pos_r, 384 * n_dims, pos_r->ne[2]), rows),
+            384, n_dims, steps);
+        ggml_tensor * out = ggml_add(C, ggml_add(C, ggml_mul_mat(C, proj_w, x), proj_b), pe);
+        ggml_set_name(out, "obs.proprio.pos");
+        ggml_set_output(out);
+        io.pos = out;
+
+        ggml_cgraph * gf = ggml_new_graph_custom(C, 256, false);
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    });
+    if (!built) {
+        std::fprintf(stderr, "vla(octo): proprio tokenizer graph build failed\n");
         return false;
     }
 
-    ggml_context * ctx = rt.open_ctx();
-    if (!ctx) return false;
-
-    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in_dim, n_dims, steps);
-    ggml_set_name(x, "octo.obs.proprio.tokens_in");
-    ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, steps);
-    ggml_set_name(rows, "octo.obs.proprio.pos_embd.rows");
-
-    ggml_tensor * pe = ggml_reshape_3d(ctx,
-        ggml_get_rows(ctx, ggml_reshape_2d(ctx, pos_r, 384 * n_dims, pos_r->ne[2]), rows),
-        384, n_dims, steps);
-    ggml_tensor * pos_t = ggml_add(ctx, ggml_add(ctx, ggml_mul_mat(ctx, proj_w_r, x), proj_b_r), pe);
-    ggml_set_name(pos_t, "obs.proprio.pos");
-    ggml_set_output(pos_t);
-
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 256, false);
-    ggml_build_forward_expand(graph, pos_t);
-    ggml_gallocr_t gallocr = rt.alloc(OctoStage::PROPRIO);
-    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
-        std::fprintf(stderr, "vla(octo): proprio tokenizer ggml_gallocr_alloc_graph failed\n");
-        ggml_free(ctx);
-        return false;
-    }
-    ggml_backend_tensor_set(x, tokens_in.data(), 0, ggml_nbytes(x));
-    ggml_backend_tensor_set(rows, pos_rows.data(), 0, ggml_nbytes(rows));
-    const ggml_status st = ggml_backend_graph_compute(rt.backend, graph);
-    if (st != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "vla(octo): proprio tokenizer ggml_backend_graph_compute failed (%d)\n", (int) st);
-        ggml_free(ctx);
-        return false;
-    }
-    ggml_backend_tensor_get(pos_t, pos_out.data(), 0, ggml_nbytes(pos_t));
-    ggml_free(ctx);
+    OctoRuntime::ProprioIO& io = rt.proprio.io();
+    ggml_backend_tensor_set(io.tokens, tokens_in.data(), 0, ggml_nbytes(io.tokens));
+    ggml_backend_tensor_set(io.rows, pos_rows.data(), 0, ggml_nbytes(io.rows));
+    if (!octo_compute(rt, rt.proprio.graph(), "proprio tokenizer")) return false;
+    ggml_backend_tensor_get(io.pos, pos_out.data(), 0, ggml_nbytes(io.pos));
     return true;
 }
 
@@ -673,46 +673,41 @@ static bool run_language_graph(OctoRuntime& rt,
     pos.assign((size_t) 16 * 384, 0.0f);
     repeated.assign((size_t) steps * 16 * 384, 0.0f);
 
-    ggml_tensor * jw = rt.weight("octo.task.language.proj.weight");
-    ggml_tensor * jb = rt.weight("octo.task.language.proj.bias");
-    ggml_tensor * pe = rt.weight("octo.task.language.pos_embd");
-    if (!jw || !jb || !pe) return false;
+    const bool built = rt.language.ensure(rt.backend, OctoRuntime::LangKey{steps}, (size_t) 4*1024*1024,
+                                          [&](ggml_context * C, OctoRuntime::LangIO& io) -> ggml_cgraph * {
+        ggml_tensor * jw = rt.weight("octo.task.language.proj.weight");
+        ggml_tensor * jb = rt.weight("octo.task.language.proj.bias");
+        ggml_tensor * pe = rt.weight("octo.task.language.pos_embd");
+        if (!jw || !jb || !pe) return nullptr;
 
-    ggml_context * ctx = rt.open_ctx();
-    if (!ctx) {
-        std::fprintf(stderr, "vla(octo): ggml_init(language graph ctx) failed\n");
+        ggml_tensor * in = ggml_new_tensor_3d(C, GGML_TYPE_F32, 768, 16, 1);
+        ggml_set_name(in, "octo.task.language.t5_inject");
+        ggml_set_input(in);
+        io.in = in;
+
+        ggml_tensor * pos_t = ggml_add(C, ggml_add(C, ggml_mul_mat(C, jw, in), jb), pe);
+        ggml_set_name(pos_t, "task_language.pos");
+        ggml_set_output(pos_t);
+        io.pos = pos_t;
+        ggml_tensor * rep = ggml_repeat_4d(C, pos_t, 384, 16, steps, 1);
+        ggml_set_name(rep, "obs_task_language.repeated");
+        ggml_set_output(rep);
+        io.repeated = rep;
+
+        ggml_cgraph * gf = ggml_new_graph_custom(C, 1024, false);
+        ggml_build_forward_expand(gf, rep);
+        return gf;
+    });
+    if (!built) {
+        std::fprintf(stderr, "vla(octo): language graph build failed\n");
         return false;
     }
 
-    ggml_tensor * inp = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 768, 16, 1);
-    ggml_set_name(inp, "octo.task.language.t5_inject");
-
-    ggml_tensor * pos_t = ggml_add(ctx, ggml_add(ctx, ggml_mul_mat(ctx, jw, inp), jb), pe);
-    ggml_set_name(pos_t, "task_language.pos");
-    ggml_set_output(pos_t);
-    ggml_tensor * repeated_t = ggml_repeat_4d(ctx, pos_t, 384, 16, steps, 1);
-    ggml_set_name(repeated_t, "obs_task_language.repeated");
-    ggml_set_output(repeated_t);
-
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 1024, false);
-    ggml_build_forward_expand(graph, repeated_t);
-    ggml_gallocr_t gallocr = rt.alloc(OctoStage::LANGUAGE);
-    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
-        std::fprintf(stderr, "vla(octo): language ggml_gallocr_alloc_graph failed\n");
-        ggml_free(ctx);
-        return false;
-    }
-    ggml_backend_tensor_set(inp, t5.data(), 0, ggml_nbytes(inp));
-    const ggml_status st = ggml_backend_graph_compute(rt.backend, graph);
-    if (st != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "vla(octo): language ggml_backend_graph_compute failed (%d)\n", (int) st);
-        ggml_free(ctx);
-        return false;
-    }
-
-    ggml_backend_tensor_get(pos_t, pos.data(), 0, ggml_nbytes(pos_t));
-    ggml_backend_tensor_get(repeated_t, repeated.data(), 0, ggml_nbytes(repeated_t));
-    ggml_free(ctx);
+    OctoRuntime::LangIO& io = rt.language.io();
+    ggml_backend_tensor_set(io.in, t5.data(), 0, ggml_nbytes(io.in));
+    if (!octo_compute(rt, rt.language.graph(), "language")) return false;
+    ggml_backend_tensor_get(io.pos, pos.data(), 0, ggml_nbytes(io.pos));
+    ggml_backend_tensor_get(io.repeated, repeated.data(), 0, ggml_nbytes(io.repeated));
     return true;
 }
 
@@ -737,21 +732,14 @@ static int32_t t5_relative_position_bucket(int32_t query_pos, int32_t key_pos, i
     return bucket;
 }
 
-// T5-base encoder-only forward as a ggml graph: embedding lookup (host-side row fetch) -> 12x
-// [T5LayerNorm(RMS) -> self-attn (shared relative-position bias + padding mask, no query scaling)
-// -> residual -> T5LayerNorm -> DenseReluDense(ReLU) -> residual] -> final T5LayerNorm.
-// TIP-ND1-B: sole T5-encoder implementation (was run_t5_encoder_graph /
-// run_t5_encoder_graph_resident, unified). The 12 blocks' attn/ffn weights, attn_rel_b, and
-// output_norm are referenced directly from the resident context; compute runs on the model's
-// real `backend` (CUDA when available, CPU otherwise). The embedding lookup is an in-graph
-// ggml_get_rows against the resident octo.t5.tok_embd.weight tensor (same op already used for
-// the relative-position-bias gather two lines below), so on a CUDA build the gather itself
-// happens on-device, no host round-trip. `backend` is NOT owned by this function -- never
-// freed here.
+// T5-base encoder over the 16-token instruction: 12 pre-norm blocks, bidirectional
+// self-attention with the relative-position bias shared from block 0, and no 1/sqrt(d_k)
+// scaling (T5 folds it into the weights). The bucket table and pad mask are host-computed
+// inputs, so the graph itself depends only on the sequence length.
 static bool run_t5_encoder_graph(OctoRuntime& rt,
                                  const std::vector<int32_t>& input_ids,
-                                          const std::vector<int32_t>& attention_mask,
-                                          std::vector<float>& t5_out) {
+                                 const std::vector<int32_t>& attention_mask,
+                                 std::vector<float>& t5_out) {
     constexpr int hidden = 768;
     constexpr int heads = 12;
     constexpr int head_dim = 64;
@@ -764,22 +752,6 @@ static bool run_t5_encoder_graph(OctoRuntime& rt,
         return false;
     }
 
-    ggml_tensor * tok_embd_r = rt.weight("octo.t5.tok_embd.weight");
-    ggml_tensor * rel_b_r = rt.weight("octo.t5.blk.0.attn_rel_b.weight");
-    ggml_tensor * outw_r = rt.weight("octo.t5.output_norm.weight");
-    if (!tok_embd_r || !rel_b_r || !outw_r) return false;
-    char rname[160];
-    ggml_tensor * blk_w[12][8];  // attn_norm, q, k, v, o, ffn_norm, ffn_up, ffn_down
-    const char * leaves[8] = {"attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
-                              "attn_o.weight", "ffn_norm.weight", "ffn_up.weight", "ffn_down.weight"};
-    for (int i = 0; i < 12; ++i) {
-        for (int j = 0; j < 8; ++j) {
-            std::snprintf(rname, sizeof(rname), "octo.t5.blk.%d.%s", i, leaves[j]);
-            blk_w[i][j] = rt.weight(rname);
-            if (!blk_w[i][j]) return false;
-        }
-    }
-
     std::vector<int32_t> bucket_idx((size_t) seq * seq);
     std::vector<float> padmask((size_t) seq * seq);
     for (int j = 0; j < seq; ++j) {          // query
@@ -789,105 +761,87 @@ static bool run_t5_encoder_graph(OctoRuntime& rt,
         }
     }
 
-    ggml_context * ctx = rt.open_ctx();
-    if (!ctx) return false;
+    const bool built = rt.t5.ensure(rt.backend, OctoRuntime::T5Key{seq}, (size_t) 16*1024*1024,
+                                    [&](ggml_context * C, OctoRuntime::T5IO& io) -> ggml_cgraph * {
+        ggml_tensor * tok_embd = rt.weight("octo.t5.tok_embd.weight");
+        ggml_tensor * rel_b    = rt.weight("octo.t5.blk.0.attn_rel_b.weight");
+        ggml_tensor * outw     = rt.weight("octo.t5.output_norm.weight");
+        if (!tok_embd || !rel_b || !outw) return nullptr;
 
-    std::vector<ggml_tensor *> tensors;
-    std::vector<std::vector<float>> payloads_f32;
-    std::vector<std::vector<int32_t>> payloads_i32;
-    auto add_f32 = [&](ggml_tensor * t, std::vector<float> data) {
-        tensors.push_back(t);
-        payloads_f32.push_back(std::move(data));
-        return t;
-    };
-    auto add_i32 = [&](ggml_tensor * t, std::vector<int32_t> data) {
-        tensors.push_back(t);
-        payloads_i32.push_back(std::move(data));
-        return t;
-    };
-
-    ggml_tensor * input_ids_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seq);
-    ggml_set_name(input_ids_t, "octo.t5.input_ids");
-    add_i32(input_ids_t, input_ids);
-    ggml_tensor * x = ggml_get_rows(ctx, tok_embd_r, input_ids_t);
-    ggml_set_name(x, "octo.t5.input_embed");
-
-    ggml_tensor * bucket = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, seq, seq);
-    ggml_set_name(bucket, "octo.t5.pos_bucket");
-    add_i32(bucket, bucket_idx);
-    ggml_tensor * rel_b = rel_b_r;
-    ggml_tensor * padmask_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq, seq);
-    ggml_set_name(padmask_t, "octo.t5.padmask");
-    add_f32(padmask_t, padmask);
-
-    ggml_tensor * pos_bucket_1d = ggml_reshape_1d(ctx, bucket, (int64_t) seq * seq);
-    ggml_tensor * pos_bias = ggml_get_rows(ctx, rel_b, pos_bucket_1d);
-    pos_bias = ggml_reshape_3d(ctx, pos_bias, heads, seq, seq);
-    pos_bias = ggml_cont(ctx, ggml_permute(ctx, pos_bias, 2, 0, 1, 3));
-    ggml_tensor * mask = ggml_add(ctx, pos_bias, padmask_t);
-
-    for (int i = 0; i < 12; ++i) {
-        ggml_tensor * n1w = blk_w[i][0];
-        ggml_tensor * Wq  = blk_w[i][1];
-        ggml_tensor * Wk  = blk_w[i][2];
-        ggml_tensor * Wv  = blk_w[i][3];
-        ggml_tensor * Wo  = blk_w[i][4];
-        ggml_tensor * n2w = blk_w[i][5];
-        ggml_tensor * Wup = blk_w[i][6];
-        ggml_tensor * Wdown = blk_w[i][7];
-
-        ggml_tensor * n1 = ggml_mul(ctx, ggml_rms_norm(ctx, x, ln_eps), n1w);
-        ggml_tensor * Q = ggml_mul_mat(ctx, Wq, n1);
-        ggml_tensor * K = ggml_mul_mat(ctx, Wk, n1);
-        ggml_tensor * V = ggml_mul_mat(ctx, Wv, n1);
-        ggml_tensor * Qh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, Q, head_dim, heads, seq), 0, 2, 1, 3));
-        ggml_tensor * Kh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, K, head_dim, heads, seq), 0, 2, 1, 3));
-        ggml_tensor * Vh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, V, head_dim, heads, seq), 1, 2, 0, 3));
-        ggml_tensor * scores = ggml_mul_mat(ctx, Kh, Qh);
-        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-        ggml_tensor * probs = ggml_soft_max_ext(ctx, scores, mask, 1.0f, 0.0f);  // T5: no 1/sqrt(d_k) scaling
-        ggml_tensor * attended = ggml_mul_mat(ctx, Vh, probs);
-        ggml_tensor * merged = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, attended, 0, 2, 1, 3)), hidden, seq);
-        ggml_tensor * attn_out = ggml_mul_mat(ctx, Wo, merged);
-        x = ggml_add(ctx, x, attn_out);
-
-        ggml_tensor * n2 = ggml_mul(ctx, ggml_rms_norm(ctx, x, ln_eps), n2w);
-        ggml_tensor * h = ggml_relu(ctx, ggml_mul_mat(ctx, Wup, n2));
-        ggml_tensor * ffn_out = ggml_mul_mat(ctx, Wdown, h);
-        x = ggml_add(ctx, x, ffn_out);
-    }
-
-    ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, x, ln_eps), outw_r);
-    ggml_set_name(out, "t5.out");
-    ggml_set_output(out);
-
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4096, false);
-    ggml_build_forward_expand(graph, out);
-    ggml_gallocr_t gallocr = rt.alloc(OctoStage::T5);
-    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
-        std::fprintf(stderr, "vla(octo): T5 encoder ggml_gallocr_alloc_graph failed\n");
-        ggml_free(ctx);
-        return false;
-    }
-    size_t fi = 0, ii = 0;
-    for (ggml_tensor * t : tensors) {
-        if (t->type == GGML_TYPE_I32) {
-            ggml_backend_tensor_set(t, payloads_i32[ii].data(), 0, ggml_nbytes(t));
-            ++ii;
-        } else {
-            ggml_backend_tensor_set(t, payloads_f32[fi].data(), 0, ggml_nbytes(t));
-            ++fi;
+        char rname[160];
+        ggml_tensor * blk_w[12][8];  // attn_norm, q, k, v, o, ffn_norm, ffn_up, ffn_down
+        const char * leaves[8] = {"attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                                  "attn_o.weight", "ffn_norm.weight", "ffn_up.weight", "ffn_down.weight"};
+        for (int i = 0; i < 12; ++i) {
+            for (int j = 0; j < 8; ++j) {
+                std::snprintf(rname, sizeof(rname), "octo.t5.blk.%d.%s", i, leaves[j]);
+                blk_w[i][j] = rt.weight(rname);
+                if (!blk_w[i][j]) return nullptr;
+            }
         }
-    }
-    const ggml_status st = ggml_backend_graph_compute(rt.backend, graph);
-    if (st != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "vla(octo): T5 encoder ggml_backend_graph_compute failed (%d)\n", (int) st);
-        ggml_free(ctx);
+
+        ggml_tensor * ids = ggml_new_tensor_1d(C, GGML_TYPE_I32, seq);
+        ggml_set_name(ids, "octo.t5.input_ids");
+        ggml_set_input(ids);
+        io.ids = ids;
+        ggml_tensor * bucket = ggml_new_tensor_2d(C, GGML_TYPE_I32, seq, seq);
+        ggml_set_name(bucket, "octo.t5.pos_bucket");
+        ggml_set_input(bucket);
+        io.bucket = bucket;
+        ggml_tensor * padmask_t = ggml_new_tensor_2d(C, GGML_TYPE_F32, seq, seq);
+        ggml_set_name(padmask_t, "octo.t5.padmask");
+        ggml_set_input(padmask_t);
+        io.padmask = padmask_t;
+
+        ggml_tensor * x = ggml_get_rows(C, tok_embd, ids);
+        ggml_set_name(x, "octo.t5.input_embed");
+
+        ggml_tensor * pos_bias = ggml_get_rows(C, rel_b, ggml_reshape_1d(C, bucket, (int64_t) seq * seq));
+        pos_bias = ggml_reshape_3d(C, pos_bias, heads, seq, seq);
+        pos_bias = ggml_cont(C, ggml_permute(C, pos_bias, 2, 0, 1, 3));
+        ggml_tensor * mask = ggml_add(C, pos_bias, padmask_t);
+
+        for (int i = 0; i < 12; ++i) {
+            ggml_tensor * n1 = ggml_mul(C, ggml_rms_norm(C, x, ln_eps), blk_w[i][0]);
+            ggml_tensor * Q = ggml_mul_mat(C, blk_w[i][1], n1);
+            ggml_tensor * K = ggml_mul_mat(C, blk_w[i][2], n1);
+            ggml_tensor * V = ggml_mul_mat(C, blk_w[i][3], n1);
+            ggml_tensor * Qh = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, Q, head_dim, heads, seq), 0, 2, 1, 3));
+            ggml_tensor * Kh = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, K, head_dim, heads, seq), 0, 2, 1, 3));
+            ggml_tensor * Vh = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, V, head_dim, heads, seq), 1, 2, 0, 3));
+            ggml_tensor * scores = ggml_mul_mat(C, Kh, Qh);
+            ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+            ggml_tensor * probs = ggml_soft_max_ext(C, scores, mask, 1.0f, 0.0f);  // T5: no 1/sqrt(d_k)
+            ggml_tensor * attended = ggml_mul_mat(C, Vh, probs);
+            ggml_tensor * merged = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, attended, 0, 2, 1, 3)), hidden, seq);
+            x = ggml_add(C, x, ggml_mul_mat(C, blk_w[i][4], merged));
+
+            ggml_tensor * n2 = ggml_mul(C, ggml_rms_norm(C, x, ln_eps), blk_w[i][5]);
+            ggml_tensor * h = ggml_relu(C, ggml_mul_mat(C, blk_w[i][6], n2));
+            x = ggml_add(C, x, ggml_mul_mat(C, blk_w[i][7], h));
+        }
+
+        ggml_tensor * out = ggml_mul(C, ggml_rms_norm(C, x, ln_eps), outw);
+        ggml_set_name(out, "t5.out");
+        ggml_set_output(out);
+        io.out = out;
+
+        ggml_cgraph * gf = ggml_new_graph_custom(C, 4096, false);
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    });
+    if (!built) {
+        std::fprintf(stderr, "vla(octo): T5 encoder graph build failed\n");
         return false;
     }
+
+    OctoRuntime::T5IO& io = rt.t5.io();
+    ggml_backend_tensor_set(io.ids, input_ids.data(), 0, ggml_nbytes(io.ids));
+    ggml_backend_tensor_set(io.bucket, bucket_idx.data(), 0, ggml_nbytes(io.bucket));
+    ggml_backend_tensor_set(io.padmask, padmask.data(), 0, ggml_nbytes(io.padmask));
+    if (!octo_compute(rt, rt.t5.graph(), "T5 encoder")) return false;
     t5_out.resize((size_t) hidden * seq);
-    ggml_backend_tensor_get(out, t5_out.data(), 0, ggml_nbytes(out));
-    ggml_free(ctx);
+    ggml_backend_tensor_get(io.out, t5_out.data(), 0, ggml_nbytes(io.out));
     return true;
 }
 
@@ -1131,12 +1085,13 @@ static ggml_tensor * build_score_actor(ggml_context * ctx,
     return ggml_add(ctx, ggml_mul_mat(ctx, w.routw, ggml_silu(ctx, x)), w.routb);
 }
 
-// DDPM reverse process: `steps` denoising iterations over the score actor, seeded from
-// `rng` (N(0,1) initial noise, plus one fresh N(0,1) draw per step while time_value > 0 --
-// the reverse process adds no noise at t=0). Each step is dispatched on its own: the steps
-// are sequentially dependent so they cannot be batched, and chaining all 20 into a single
-// graph measured slower on both CUDA and CPU (a 20x larger graph to build and allocate,
-// which costs more than the device syncs it saves for a head this small).
+// DDPM reverse process, built as ONE graph. The steps are sequentially dependent so they
+// cannot be batched, but chaining them inside a single cached graph means the build cost is
+// paid once and each frame then costs one submission and one readback instead of twenty.
+//
+// All the noise the chain consumes is drawn up front, in the same order and count as a
+// step-at-a-time loop would (the initial sample, then one per step while time_value > 0 --
+// the reverse process adds none at t=0), so a given RNG state yields the same trajectory.
 static bool run_diffusion(OctoRuntime& rt,
                           std::mt19937& rng,
                           const std::vector<float>& readout_action,
@@ -1149,74 +1104,89 @@ static bool run_diffusion(OctoRuntime& rt,
     constexpr float max_action = 5.0f;
     if (readout_action.size() != (size_t) 384 * width || width < 1 || action < 1) return false;
 
-    // Resolved once rather than per step: wt() is a linear scan of the resident context, and
-    // the head needs 27 of them.
-    OctoScoreActorWeights w{};
-    if (!resolve_score_actor_weights(rt, w)) return false;
-
     const OctoDiffusionSchedule sched = make_cosine_schedule();
-    std::normal_distribution<float> normal(0.0f, 1.0f);
-    std::vector<float> x((size_t) width * action);
-    for (float& v : x) v = normal(rng);
-    std::vector<float> z((size_t) width * action);
-    std::vector<float> eps((size_t) width * action);
-    std::vector<float> time_data((size_t) width);
+    const size_t chunk = (size_t) width * action;
 
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> initial_noise(chunk);
+    for (float& v : initial_noise) v = normal(rng);
+    std::vector<float> z(chunk * steps, 0.0f);   // the last step (time_value 0) draws none.
+    std::vector<float> times((size_t) width * steps);
     for (int step = 0; step < steps; ++step) {
         const int time_value = steps - 1 - step;
-
-        ggml_context * ctx = rt.open_ctx();
-        if (!ctx) return false;
-        ggml_tensor * time = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, width);
-        ggml_set_name(time, "action_head.time");
-        ggml_tensor * obs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 384, width);
-        ggml_set_name(obs, "action_head.readout_embedding");
-        ggml_tensor * actions = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, action, width);
-        ggml_set_name(actions, "action_head.noisy_action");
-
-        ggml_tensor * out = build_score_actor(ctx, w, time, obs, actions);
-        ggml_set_name(out, "action_head.pred_eps");
-        ggml_set_output(out);
-
-        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 2048, false);
-        ggml_build_forward_expand(graph, out);
-        ggml_gallocr_t gallocr = rt.alloc(OctoStage::SCORE_ACTOR);
-        if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
-            std::fprintf(stderr, "vla(octo): score actor ggml_gallocr_alloc_graph failed\n");
-            ggml_free(ctx);
-            return false;
-        }
-        std::fill(time_data.begin(), time_data.end(), (float) time_value);
-        ggml_backend_tensor_set(time, time_data.data(), 0, ggml_nbytes(time));
-        ggml_backend_tensor_set(obs, readout_action.data(), 0, ggml_nbytes(obs));
-        ggml_backend_tensor_set(actions, x.data(), 0, ggml_nbytes(actions));
-        const ggml_status st = ggml_backend_graph_compute(rt.backend, graph);
-        if (st != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "vla(octo): score actor ggml_backend_graph_compute failed (%d)\n", (int) st);
-            ggml_free(ctx);
-            return false;
-        }
-        ggml_backend_tensor_get(out, eps.data(), 0, ggml_nbytes(out));
-        ggml_free(ctx);
-
         if (time_value > 0) {
-            for (float& v : z) v = normal(rng);
+            for (size_t i = 0; i < chunk; ++i) z[(size_t) step * chunk + i] = normal(rng);
         }
-        const float alpha = sched.alphas[(size_t) time_value];
-        const float beta = sched.betas[(size_t) time_value];
-        const float alpha_hat = sched.alpha_hats[(size_t) time_value];
-        const float alpha_1 = 1.0f / std::sqrt(alpha);
-        const float alpha_2 = (1.0f - alpha) / std::sqrt(1.0f - alpha_hat);
-        for (size_t i = 0; i < x.size(); ++i) x[i] = alpha_1 * (x[i] - alpha_2 * eps[i]);
-        if (time_value > 0) {
-            const float sigma = std::sqrt(beta);
-            for (size_t i = 0; i < x.size(); ++i) x[i] += sigma * z[i];
-        }
-        for (float& v : x) v = std::min(std::max(v, -max_action), max_action);
+        for (int i = 0; i < width; ++i) times[(size_t) step * width + i] = (float) time_value;
     }
 
-    // sample_actions() returns the last window timestep's chunk.
-    final_actions.assign(x.end() - action, x.end());
+    const OctoRuntime::DiffKey key{width, action, steps};
+    const bool built = rt.diffusion.ensure(rt.backend, key, (size_t) 32*1024*1024,
+                                           [&](ggml_context * C, OctoRuntime::DiffIO& io) -> ggml_cgraph * {
+        OctoScoreActorWeights w{};
+        if (!resolve_score_actor_weights(rt, w)) return nullptr;
+
+        ggml_tensor * obs = ggml_new_tensor_2d(C, GGML_TYPE_F32, 384, width);
+        ggml_set_name(obs, "action_head.readout_embedding");
+        ggml_set_input(obs);
+        io.obs = obs;
+        ggml_tensor * x0 = ggml_new_tensor_2d(C, GGML_TYPE_F32, action, width);
+        ggml_set_name(x0, "action_head.initial_noise");
+        ggml_set_input(x0);
+        io.x0 = x0;
+        ggml_tensor * z_all = ggml_new_tensor_3d(C, GGML_TYPE_F32, action, width, steps);
+        ggml_set_name(z_all, "action_head.step_noise");
+        ggml_set_input(z_all);
+        io.z = z_all;
+        ggml_tensor * times_all = ggml_new_tensor_3d(C, GGML_TYPE_F32, 1, width, steps);
+        ggml_set_name(times_all, "action_head.time");
+        ggml_set_input(times_all);
+        io.times = times_all;
+
+        ggml_tensor * x = x0;
+        for (int step = 0; step < steps; ++step) {
+            const int time_value = steps - 1 - step;
+            const float alpha = sched.alphas[(size_t) time_value];
+            const float beta = sched.betas[(size_t) time_value];
+            const float alpha_hat = sched.alpha_hats[(size_t) time_value];
+            const float alpha_1 = 1.0f / std::sqrt(alpha);
+            const float alpha_2 = (1.0f - alpha) / std::sqrt(1.0f - alpha_hat);
+
+            ggml_tensor * time = ggml_view_2d(C, times_all, 1, width, times_all->nb[1],
+                                              (size_t) step * times_all->nb[2]);
+            ggml_tensor * eps = build_score_actor(C, w, time, obs, x);
+            // x <- clamp(alpha_1 * (x - alpha_2 * eps) [+ sqrt(beta) * z], +/- max_action)
+            ggml_tensor * y = ggml_scale(C, ggml_add(C, x, ggml_scale(C, eps, -alpha_2)), alpha_1);
+            if (time_value > 0) {
+                ggml_tensor * zs = ggml_view_2d(C, z_all, action, width, z_all->nb[1],
+                                                (size_t) step * z_all->nb[2]);
+                y = ggml_add(C, y, ggml_scale(C, zs, std::sqrt(beta)));
+            }
+            x = ggml_clamp(C, y, -max_action, max_action);
+        }
+        // sample_actions() returns the last window timestep's chunk.
+        ggml_tensor * out = ggml_cont(C, ggml_view_1d(C, x, action, (size_t) (width - 1) * x->nb[1]));
+        ggml_set_name(out, "action_head.final_actions");
+        ggml_set_output(out);
+        io.out = out;
+
+        ggml_cgraph * gf = ggml_new_graph_custom(C, 4096, false);
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    });
+    if (!built) {
+        std::fprintf(stderr, "vla(octo): diffusion graph build failed\n");
+        return false;
+    }
+
+    OctoRuntime::DiffIO& io = rt.diffusion.io();
+    ggml_backend_tensor_set(io.obs, readout_action.data(), 0, ggml_nbytes(io.obs));
+    ggml_backend_tensor_set(io.x0, initial_noise.data(), 0, ggml_nbytes(io.x0));
+    ggml_backend_tensor_set(io.z, z.data(), 0, ggml_nbytes(io.z));
+    ggml_backend_tensor_set(io.times, times.data(), 0, ggml_nbytes(io.times));
+    if (!octo_compute(rt, rt.diffusion.graph(), "diffusion")) return false;
+    final_actions.resize((size_t) action);
+    ggml_backend_tensor_get(io.out, final_actions.data(), 0, ggml_nbytes(io.out));
     return true;
 }
 
@@ -1228,138 +1198,104 @@ struct OctoL1HeadResult {
     std::vector<float> final_actions;   // [action_total] -- mean_normalized[:, window_size-1]
 };
 
-// readout_action: [384,window_size] (the block-transformer's readout_action output, one
-// 384-dim token per timestep -- readouts.action=1 so there is exactly one token/timestep
-// already, matching MAPHeadPt's (b,w,1,384) input shape with the "1" dim implicit). No
-// attention happens ACROSS window_size or across batch: MAPHeadPt's nn.MultiheadAttention
-// runs independently per (batch,timestep) pair (query=probe, key=value=that timestep's
-// single token) -- window_size is therefore modeled as a batch axis (ggml ne3) here, heads
-// as a second batch axis (ne2), never mixed via the ne0/ne1 axes mul_mat actually contracts
-// over/compares. See TIP-05 Completion Report for the full ggml shape derivation.
 static bool run_l1_action_head_graph(OctoRuntime& rt,
                                      const std::vector<float>& readout_action,
-                                              int window_size,
-                                              int action_total,
-                                              OctoL1HeadResult& result) {
+                                     int window_size,
+                                     int action_total,
+                                     OctoL1HeadResult& result) {
     constexpr int hidden = 384;
-    constexpr int map_heads = 8;          // TIP-05: 8, NOT the block-transformer's 6.
+    constexpr int map_heads = 8;                      // 8, NOT the block transformer's 6.
     constexpr int map_head_dim = hidden / map_heads;  // 48
     constexpr float ln_eps = 1e-6f;
     constexpr float max_action = 5.0f;
     const int width = window_size;
     if (readout_action.size() != (size_t) hidden * width || action_total <= 0) return false;
 
-    ggml_tensor * probe_r      = rt.weight("octo.head.l1.map.probe");
-    ggml_tensor * qkv_w_r      = rt.weight("octo.head.l1.map.attn_qkv.weight");
-    ggml_tensor * qkv_b_r      = rt.weight("octo.head.l1.map.attn_qkv.bias");
-    ggml_tensor * o_w_r        = rt.weight("octo.head.l1.map.attn_o.weight");
-    ggml_tensor * o_b_r        = rt.weight("octo.head.l1.map.attn_o.bias");
-    ggml_tensor * norm_w_r     = rt.weight("octo.head.l1.map.norm.weight");
-    ggml_tensor * norm_b_r     = rt.weight("octo.head.l1.map.norm.bias");
-    ggml_tensor * ffn_up_w_r   = rt.weight("octo.head.l1.map.ffn_up.weight");
-    ggml_tensor * ffn_up_b_r   = rt.weight("octo.head.l1.map.ffn_up.bias");
-    ggml_tensor * ffn_down_w_r = rt.weight("octo.head.l1.map.ffn_down.weight");
-    ggml_tensor * ffn_down_b_r = rt.weight("octo.head.l1.map.ffn_down.bias");
-    ggml_tensor * mean_w_r     = rt.weight("octo.head.l1.mean_proj.weight");
-    ggml_tensor * mean_b_r     = rt.weight("octo.head.l1.mean_proj.bias");
-    if (!probe_r || !qkv_w_r || !qkv_b_r || !o_w_r || !o_b_r || !norm_w_r || !norm_b_r ||
-        !ffn_up_w_r || !ffn_up_b_r || !ffn_down_w_r || !ffn_down_b_r || !mean_w_r || !mean_b_r) {
+    const OctoRuntime::L1Key key{width, action_total};
+    const bool built = rt.l1_head.ensure(rt.backend, key, (size_t) 8*1024*1024,
+                                         [&](ggml_context * C, OctoRuntime::L1IO& io) -> ggml_cgraph * {
+        ggml_tensor * probe      = rt.weight("octo.head.l1.map.probe");
+        ggml_tensor * qkv_w      = rt.weight("octo.head.l1.map.attn_qkv.weight");
+        ggml_tensor * qkv_b      = rt.weight("octo.head.l1.map.attn_qkv.bias");
+        ggml_tensor * o_w        = rt.weight("octo.head.l1.map.attn_o.weight");
+        ggml_tensor * o_b        = rt.weight("octo.head.l1.map.attn_o.bias");
+        ggml_tensor * norm_w     = rt.weight("octo.head.l1.map.norm.weight");
+        ggml_tensor * norm_b     = rt.weight("octo.head.l1.map.norm.bias");
+        ggml_tensor * ffn_up_w   = rt.weight("octo.head.l1.map.ffn_up.weight");
+        ggml_tensor * ffn_up_b   = rt.weight("octo.head.l1.map.ffn_up.bias");
+        ggml_tensor * ffn_down_w = rt.weight("octo.head.l1.map.ffn_down.weight");
+        ggml_tensor * ffn_down_b = rt.weight("octo.head.l1.map.ffn_down.bias");
+        ggml_tensor * mean_w     = rt.weight("octo.head.l1.mean_proj.weight");
+        ggml_tensor * mean_b     = rt.weight("octo.head.l1.mean_proj.bias");
+        if (!probe || !qkv_w || !qkv_b || !o_w || !o_b || !norm_w || !norm_b ||
+            !ffn_up_w || !ffn_up_b || !ffn_down_w || !ffn_down_b || !mean_w || !mean_b) {
+            return nullptr;
+        }
+
+        ggml_tensor * x = ggml_new_tensor_2d(C, GGML_TYPE_F32, hidden, width);
+        ggml_set_name(x, "l1_head.readout_action");
+        ggml_set_input(x);
+        io.readout = x;
+
+        // Q comes from the probe, K/V from x -- two different inputs through the SAME
+        // combined in_proj_weight, so each needs its own mul_mat and the slice it does not
+        // need is left unused (matches nn.MultiheadAttention, whose in_proj_weight row
+        // blocks are always [Wq;Wk;Wv] regardless of what is fed through it).
+        ggml_tensor * qkv_probe = ggml_add(C, ggml_mul_mat(C, qkv_w, probe), qkv_b);
+        ggml_tensor * q = ggml_cont(C, ggml_view_2d(C, qkv_probe, hidden, 1, qkv_probe->nb[1], 0));
+        ggml_tensor * qkv_x = ggml_add(C, ggml_mul_mat(C, qkv_w, x), qkv_b);
+        ggml_tensor * k = ggml_cont(C, ggml_view_2d(C, qkv_x, hidden, width, qkv_x->nb[1], (size_t) hidden * qkv_x->nb[0]));
+        ggml_tensor * v = ggml_cont(C, ggml_view_2d(C, qkv_x, hidden, width, qkv_x->nb[1], (size_t) 2 * hidden * qkv_x->nb[0]));
+
+        // heads on ne2 and window on ne3 are both batch axes mul_mat loops over, never
+        // cross-multiplied, which is what keeps each timestep's attention independent.
+        ggml_tensor * Qh = ggml_cont(C, ggml_permute(C, ggml_reshape_4d(C, q, map_head_dim, map_heads, 1, 1), 0, 2, 1, 3));
+        ggml_tensor * Kh = ggml_cont(C, ggml_permute(C, ggml_reshape_4d(C, k, map_head_dim, map_heads, 1, width), 0, 2, 1, 3));
+        ggml_tensor * Vh = ggml_cont(C, ggml_permute(C, ggml_reshape_4d(C, v, map_head_dim, map_heads, 1, width), 1, 2, 0, 3));
+
+        ggml_tensor * scores = ggml_mul_mat(C, Qh, Kh);
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        // seq_k == 1 always (readouts.action == 1 token per timestep), so this softmax is
+        // over a single logit and always yields 1.0 -- kept as the real op so the graph
+        // stays correct if that ever changes.
+        ggml_tensor * probs = ggml_soft_max_ext(C, scores, nullptr, 1.0f / std::sqrt((float) map_head_dim), 0.0f);
+        ggml_tensor * attended = ggml_mul_mat(C, Vh, probs);
+        ggml_tensor * merged = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, attended, 0, 2, 1, 3)), hidden, width);
+
+        ggml_tensor * attn_out = ggml_add(C, ggml_mul_mat(C, o_w, merged), o_b);
+        ggml_tensor * y = ggml_add(C, ggml_mul(C, ggml_norm(C, attn_out, ln_eps), norm_w), norm_b);
+        ggml_tensor * h = ggml_gelu_erf(C, ggml_add(C, ggml_mul_mat(C, ffn_up_w, y), ffn_up_b));
+        h = ggml_add(C, ggml_mul_mat(C, ffn_down_w, h), ffn_down_b);
+        // Residual is onto attn_out (pre-LN), matching MlpBlockPt's use inside MAPHeadPt.
+        ggml_tensor * emb = ggml_add(C, attn_out, h);
+
+        ggml_tensor * mean_raw = ggml_add(C, ggml_mul_mat(C, mean_w, emb), mean_b);
+        ggml_tensor * out = ggml_scale(C, ggml_tanh(C, ggml_scale(C, mean_raw, 1.0f / max_action)), max_action);
+        ggml_set_name(out, "l1_head.mean_normalized");
+        ggml_set_output(out);
+        if (ggml_nelements(out) != (int64_t) action_total * width) {
+            std::fprintf(stderr, "vla(octo): L1 head mean_proj out-dim=%lld does not match action_horizon*action_dim=%d\n",
+                         (long long) out->ne[0], action_total);
+            return nullptr;
+        }
+        io.out = out;
+
+        ggml_cgraph * gf = ggml_new_graph_custom(C, 512, false);
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    });
+    if (!built) {
+        std::fprintf(stderr, "vla(octo): L1 head graph build failed\n");
         return false;
     }
 
-    ggml_context * ctx = rt.open_ctx();
-    if (!ctx) return false;
-
-    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, width);
-    ggml_set_name(x, "l1_head.readout_action");
-
-    // probe is resident weight octo.head.l1.map.probe, PyTorch shape (1,1,384) -> GGUF
-    // drops the leading size-1 dims at load (ggml_n_dims), so it's already a plain
-    // ne=[384,1,1,1] resident tensor -- exactly the "[384,1] single query token" shape
-    // needed below, used directly with no reshape (same convention as every other
-    // resident weight in this file: mul_mat/add operands reference wt()'s result as-is
-    // unless a host-side transform is needed, per house style -- see conv weights below
-    // needing tensor_to_vec vs. attention weights that don't).
-    //
-    // Q comes from probe (query), K/V come from x (key=value=this timestep's readout
-    // token) -- two DIFFERENT inputs through the SAME combined in_proj_weight, so (unlike
-    // the block-transformer's self-attention, where q/k/v all come from one input and can
-    // share one mul_mat) each needs its own mul_mat against the full [384,1152] qkv
-    // weight; the slice not needed from each (k/v from the probe pass, q from the x pass)
-    // is simply left unused, same in_proj_weight both passes (matches
-    // nn.MultiheadAttention where in_proj_weight's 3 row-blocks are always [Wq;Wk;Wv]
-    // regardless of what query/key/value tensors get fed through it).
-    ggml_tensor * qkv_probe = ggml_add(ctx, ggml_mul_mat(ctx, qkv_w_r, probe_r), qkv_b_r);
-    ggml_tensor * q = ggml_cont(ctx, ggml_view_2d(ctx, qkv_probe, hidden, 1, qkv_probe->nb[1], 0));
-    ggml_tensor * qkv_x = ggml_add(ctx, ggml_mul_mat(ctx, qkv_w_r, x), qkv_b_r);
-    ggml_tensor * k = ggml_cont(ctx, ggml_view_2d(ctx, qkv_x, hidden, width, qkv_x->nb[1], (size_t) hidden * qkv_x->nb[0]));
-    ggml_tensor * v = ggml_cont(ctx, ggml_view_2d(ctx, qkv_x, hidden, width, qkv_x->nb[1], (size_t) 2 * hidden * qkv_x->nb[0]));
-
-    // Split into heads with heads on ne2 (a batch axis mul_mat loops over, never
-    // cross-multiplied) and width on ne3 (a SECOND batch axis) -- this is what keeps each
-    // timestep's attention independent (no cross-timestep mixing) while still doing
-    // per-head dot products correctly. Qh's ne3=1 broadcasts into Kh/Vh's ne3=width per
-    // ggml_can_mul_mat (t1->ne3 % t0->ne3 == 0, t0=the smaller/A operand).
-    ggml_tensor * Qh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, map_head_dim, map_heads, 1, 1), 0, 2, 1, 3));
-    ggml_tensor * Kh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, k, map_head_dim, map_heads, 1, width), 0, 2, 1, 3));
-    ggml_tensor * Vh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, v, map_head_dim, map_heads, 1, width), 1, 2, 0, 3));
-
-    ggml_tensor * scores = ggml_mul_mat(ctx, Qh, Kh);  // [1(seq_q),1(seq_k),heads,width]
-    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-    // seq_k==1 always (readouts.action==1 token/timestep) so this softmax is over a
-    // single logit -- always exactly 1.0 -- computed via the real op (not hand-simplified
-    // to "skip attention") so this stays correct if that ever changes, and so TIP-06 can
-    // dump a genuine attn-probability boundary.
-    ggml_tensor * probs = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / std::sqrt((float) map_head_dim), 0.0f);
-    ggml_tensor * attended = ggml_mul_mat(ctx, Vh, probs);  // [head_dim,1,heads,width]
-    ggml_tensor * merged = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, attended, 0, 2, 1, 3)), hidden, width);
-
-    ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, o_w_r, merged), o_b_r);
-    ggml_set_name(attn_out, "l1_head.map.attn_out");
-
-    ggml_tensor * y = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, attn_out, ln_eps), norm_w_r), norm_b_r);
-    ggml_tensor * h = ggml_gelu_erf(ctx, ggml_add(ctx, ggml_mul_mat(ctx, ffn_up_w_r, y), ffn_up_b_r));
-    h = ggml_add(ctx, ggml_mul_mat(ctx, ffn_down_w_r, h), ffn_down_b_r);
-    // Residual is onto attn_out (pre-LN), not onto y -- per TIP-05 spec, matches
-    // MlpBlockPt's usage inside MAPHeadPt (out = attn_out + MlpBlock(LayerNorm(attn_out))).
-    ggml_tensor * emb = ggml_add(ctx, attn_out, h);
-    ggml_set_name(emb, "l1_head.map.emb");
-
-    ggml_tensor * mean_raw = ggml_add(ctx, ggml_mul_mat(ctx, mean_w_r, emb), mean_b_r);
-    ggml_tensor * mean_final = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, mean_raw, 1.0f / max_action)), max_action);
-    ggml_set_name(mean_final, "l1_head.mean_normalized");
-    ggml_set_output(mean_final);
-
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
-    ggml_build_forward_expand(graph, mean_final);
-    ggml_gallocr_t gallocr = rt.alloc(OctoStage::L1_HEAD);
-    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
-        std::fprintf(stderr, "vla(octo): L1 head ggml_gallocr_alloc_graph failed\n");
-        ggml_free(ctx);
-        return false;
-    }
-    ggml_backend_tensor_set(x, readout_action.data(), 0, ggml_nbytes(x));
-    const ggml_status st = ggml_backend_graph_compute(rt.backend, graph);
-    if (st != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "vla(octo): L1 head ggml_backend_graph_compute failed (%d)\n", (int) st);
-        ggml_free(ctx);
-        return false;
-    }
-
+    OctoRuntime::L1IO& io = rt.l1_head.io();
+    ggml_backend_tensor_set(io.readout, readout_action.data(), 0, ggml_nbytes(io.readout));
+    if (!octo_compute(rt, rt.l1_head.graph(), "L1 head")) return false;
     result.mean_normalized.resize((size_t) action_total * width);
-    if ((size_t) ggml_nelements(mean_final) != result.mean_normalized.size()) {
-        std::fprintf(stderr, "vla(octo): L1 head mean_proj out-dim=%lld does not match action_horizon*action_dim=%d\n",
-                     (long long) mean_final->ne[0], action_total);
-        ggml_free(ctx);
-        return false;
-    }
-    ggml_backend_tensor_get(mean_final, result.mean_normalized.data(), 0, ggml_nbytes(mean_final));
-
-    // predict_action: last window timestep only (matches diffusion's own final-action-slice
-    // convention -- see run_diffusion_resident's "final action slice" comment/the
-    // octo_action_slice tripwire test).
+    ggml_backend_tensor_get(io.out, result.mean_normalized.data(), 0, ggml_nbytes(io.out));
+    // predict_action: last window timestep only, matching the diffusion head's own slice.
     result.final_actions.assign(result.mean_normalized.end() - action_total, result.mean_normalized.end());
-    ggml_free(ctx);
     return true;
 }
 
@@ -1379,21 +1315,35 @@ static bool read_kv_u8_array(const gguf_reader& g, const char * key, std::vector
     return true;
 }
 
-// Nearest-neighbor resize from interleaved HWC RGB8 (arbitrary size) to a
-// dside x dside planar CHW RGB8 buffer, matching the [C,H,W] layout
-// run_one_obs_tokenizer_graph expects for its obs/task tensors.
-static void resize_to_planar_chw(const uint8_t * src_hwc, int sw, int sh, int dside, std::vector<uint8_t>& dst_chw) {
-    dst_chw.assign((size_t) 3 * dside * dside, 0);
-    for (int yy = 0; yy < dside; ++yy) {
-        const int sy = std::min(sh - 1, (int) ((int64_t) yy * sh / dside));
-        for (int xx = 0; xx < dside; ++xx) {
-            const int sx = std::min(sw - 1, (int) ((int64_t) xx * sw / dside));
-            const uint8_t * px = src_hwc + ((size_t) sy * sw + sx) * 3;
-            for (int c = 0; c < 3; ++c) {
-                dst_chw[((size_t) c * dside + yy) * dside + xx] = px[c];
-            }
+// The server path already receives side x side frames (the client resizes -- see
+// eval/client/adapters.py), which is the convention modules/preprocess.h enforces for every
+// arch. vla-cli can hand us an arbitrary image file, so resize first when it does not match.
+static void resize_hwc(const uint8_t * src, int sw, int sh, int side, std::vector<uint8_t>& dst) {
+    dst.resize((size_t) 3 * side * side);
+    for (int y = 0; y < side; ++y) {
+        const int sy = std::min(sh - 1, (int) ((int64_t) y * sh / side));
+        for (int x = 0; x < side; ++x) {
+            const int sx = std::min(sw - 1, (int) ((int64_t) x * sw / side));
+            const uint8_t * px = src + ((size_t) sy * sw + sx) * 3;
+            uint8_t * out = dst.data() + ((size_t) y * side + x) * 3;
+            out[0] = px[0]; out[1] = px[1]; out[2] = px[2];
         }
     }
+}
+
+// One camera frame as normalized CHW floats, through the shared preprocessing helper.
+static bool octo_prepare_view(const ImageView& v, int side, std::vector<float>& out) {
+    if (v.format != PixelFormat::U8 || !v.data) {
+        std::fprintf(stderr, "vla(octo): predict only supports PixelFormat::U8 images\n");
+        return false;
+    }
+    if (v.w == side && v.h == side) {
+        return preprocess_image_chw("octo", v, side, out);
+    }
+    std::vector<uint8_t> resized;
+    resize_hwc((const uint8_t *) v.data, v.w, v.h, side, resized);
+    const ImageView rv{resized.data(), side, side, PixelFormat::U8};
+    return preprocess_image_chw("octo", rv, side, out);
 }
 
 // Resolves which top-level key of octo.dataset_statistics to un-normalize against when
@@ -1550,102 +1500,89 @@ static bool run_transformer_graph(OctoRuntime& rt,
     const int n_readout = (int) layout.readout_seq_idx.size();
     if (input.size() != (size_t) hidden * seq || blocked_mask.size() != (size_t) seq * seq) return false;
 
-    char rname[160];
-    ggml_tensor * blk_w[12][10];  // attn_norm.{w,b}, attn_qkv.{w,b}, attn_o.{w,b}, ffn_norm.{w,b}, ffn_up.{w,b}
-    const char * leaves[10] = {"attn_norm.weight", "attn_norm.bias", "attn_qkv.weight", "attn_qkv.bias",
-                               "attn_o.weight", "attn_o.bias", "ffn_norm.weight", "ffn_norm.bias",
-                               "ffn_up.weight", "ffn_up.bias"};
-    ggml_tensor * ffn_down_w[12];
-    ggml_tensor * ffn_down_b[12];
-    for (int i = 0; i < 12; ++i) {
-        for (int j = 0; j < 10; ++j) {
-            std::snprintf(rname, sizeof(rname), "octo.blk.%d.%s", i, leaves[j]);
-            blk_w[i][j] = rt.weight(rname);
-            if (!blk_w[i][j]) return false;
+    const OctoRuntime::BtKey key{seq, n_readout};
+    const bool built = rt.transformer.ensure(rt.backend, key, (size_t) 32*1024*1024,
+                                             [&](ggml_context * C, OctoRuntime::BtIO& io) -> ggml_cgraph * {
+        char rname[160];
+        // attn_norm.{w,b}, attn_qkv.{w,b}, attn_o.{w,b}, ffn_norm.{w,b}, ffn_up.{w,b}, ffn_down.{w,b}
+        ggml_tensor * blk_w[12][12];
+        const char * leaves[12] = {"attn_norm.weight", "attn_norm.bias", "attn_qkv.weight", "attn_qkv.bias",
+                                   "attn_o.weight", "attn_o.bias", "ffn_norm.weight", "ffn_norm.bias",
+                                   "ffn_up.weight", "ffn_up.bias", "ffn_down.weight", "ffn_down.bias"};
+        for (int i = 0; i < 12; ++i) {
+            for (int j = 0; j < 12; ++j) {
+                std::snprintf(rname, sizeof(rname), "octo.blk.%d.%s", i, leaves[j]);
+                blk_w[i][j] = rt.weight(rname);
+                if (!blk_w[i][j]) return nullptr;
+            }
         }
-        std::snprintf(rname, sizeof(rname), "octo.blk.%d.ffn_down.weight", i);
-        ffn_down_w[i] = rt.weight(rname);
-        std::snprintf(rname, sizeof(rname), "octo.blk.%d.ffn_down.bias", i);
-        ffn_down_b[i] = rt.weight(rname);
-        if (!ffn_down_w[i] || !ffn_down_b[i]) return false;
-    }
-    ggml_tensor * out_w_r = rt.weight("octo.output_norm.weight");
-    ggml_tensor * out_b_r = rt.weight("octo.output_norm.bias");
-    if (!out_w_r || !out_b_r) return false;
+        ggml_tensor * out_w = rt.weight("octo.output_norm.weight");
+        ggml_tensor * out_b = rt.weight("octo.output_norm.bias");
+        if (!out_w || !out_b) return nullptr;
 
-    ggml_context * ctx = rt.open_ctx();
-    if (!ctx) return false;
+        ggml_tensor * x = ggml_new_tensor_2d(C, GGML_TYPE_F32, hidden, seq);
+        ggml_set_name(x, "octo.block_transformer.input");
+        ggml_set_input(x);
+        io.input = x;
+        // [seq,seq] with no head axis: ggml_soft_max_ext broadcasts a mask whose ne2 is 1
+        // over every head, so there is no reason to materialize six copies of it.
+        ggml_tensor * mask = ggml_new_tensor_2d(C, GGML_TYPE_F32, seq, seq);
+        ggml_set_name(mask, "octo.block_transformer.additive_mask");
+        ggml_set_input(mask);
+        io.mask = mask;
+        ggml_tensor * readout_idx = ggml_new_tensor_1d(C, GGML_TYPE_I32, n_readout);
+        ggml_set_name(readout_idx, "octo.block_transformer.readout_idx");
+        ggml_set_input(readout_idx);
+        io.readout_idx = readout_idx;
 
-    ggml_tensor * input_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, seq);
-    ggml_set_name(input_t, "octo.block_transformer.input");
-    ggml_tensor * x = input_t;
-    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq, seq);
-    ggml_set_name(mask, "octo.block_transformer.additive_mask");
-    ggml_tensor * readout_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_readout);
-    ggml_set_name(readout_idx, "octo.block_transformer.readout_idx");
+        for (int i = 0; i < 12; ++i) {
+            ggml_tensor * n1 = ggml_add(C, ggml_mul(C, ggml_norm(C, x, ln_eps), blk_w[i][0]), blk_w[i][1]);
+            ggml_tensor * qkv = ggml_add(C, ggml_mul_mat(C, blk_w[i][2], n1), blk_w[i][3]);
+            ggml_tensor * q = ggml_cont(C, ggml_view_2d(C, qkv, hidden, seq, qkv->nb[1], 0));
+            ggml_tensor * k = ggml_cont(C, ggml_view_2d(C, qkv, hidden, seq, qkv->nb[1], (size_t) hidden * qkv->nb[0]));
+            ggml_tensor * v = ggml_cont(C, ggml_view_2d(C, qkv, hidden, seq, qkv->nb[1], (size_t) 2 * hidden * qkv->nb[0]));
+            ggml_tensor * Q = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, q, head_dim, heads, seq), 0, 2, 1, 3));
+            ggml_tensor * K = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, k, head_dim, heads, seq), 0, 2, 1, 3));
+            ggml_tensor * V = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, v, head_dim, heads, seq), 1, 2, 0, 3));
+            ggml_tensor * scores = ggml_mul_mat(C, K, Q);
+            ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+            ggml_tensor * probs = ggml_soft_max_ext(C, scores, mask, attn_scale, 0.0f);
+            ggml_tensor * attended = ggml_mul_mat(C, V, probs);
+            ggml_tensor * merged = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, attended, 0, 2, 1, 3)), hidden, seq);
+            ggml_tensor * attn_out = ggml_add(C, ggml_mul_mat(C, blk_w[i][4], merged), blk_w[i][5]);
+            ggml_tensor * residual = ggml_add(C, x, attn_out);
+            ggml_tensor * n2 = ggml_add(C, ggml_mul(C, ggml_norm(C, residual, ln_eps), blk_w[i][6]), blk_w[i][7]);
+            ggml_tensor * mlp = ggml_add(C, ggml_mul_mat(C, blk_w[i][8], n2), blk_w[i][9]);
+            mlp = ggml_gelu_erf(C, mlp);
+            mlp = ggml_add(C, ggml_mul_mat(C, blk_w[i][10], mlp), blk_w[i][11]);
+            x = ggml_add(C, residual, mlp);
+        }
 
-    for (int i = 0; i < 12; ++i) {
-        ggml_tensor * n1w = blk_w[i][0];
-        ggml_tensor * n1b = blk_w[i][1];
-        ggml_tensor * Wqkv = blk_w[i][2];
-        ggml_tensor * bqkv = blk_w[i][3];
-        ggml_tensor * Wo = blk_w[i][4];
-        ggml_tensor * bo = blk_w[i][5];
-        ggml_tensor * n2w = blk_w[i][6];
-        ggml_tensor * n2b = blk_w[i][7];
-        ggml_tensor * Wup = blk_w[i][8];
-        ggml_tensor * bup = blk_w[i][9];
+        ggml_tensor * output = ggml_add(C, ggml_mul(C, ggml_norm(C, x, ln_eps), out_w), out_b);
+        // The readout tokens are not evenly spaced once padded timesteps drop their
+        // observation groups, so gather them by sequence index rather than striding.
+        ggml_tensor * readout = ggml_get_rows(C, output, readout_idx);
+        ggml_set_name(readout, "bt.readout_action");
+        ggml_set_output(readout);
+        io.out = readout;
 
-        ggml_tensor * n1 = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, ln_eps), n1w), n1b);
-        ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, Wqkv, n1), bqkv);
-        ggml_tensor * q = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden, seq, qkv->nb[1], 0));
-        ggml_tensor * k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden, seq, qkv->nb[1], (size_t) hidden * qkv->nb[0]));
-        ggml_tensor * v = ggml_cont(ctx, ggml_view_2d(ctx, qkv, hidden, seq, qkv->nb[1], (size_t) 2 * hidden * qkv->nb[0]));
-        ggml_tensor * Q = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, q, head_dim, heads, seq), 0, 2, 1, 3));
-        ggml_tensor * K = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, head_dim, heads, seq), 0, 2, 1, 3));
-        ggml_tensor * V = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, v, head_dim, heads, seq), 1, 2, 0, 3));
-        ggml_tensor * scores = ggml_mul_mat(ctx, K, Q);
-        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-        ggml_tensor * probs = ggml_soft_max_ext(ctx, scores, mask, attn_scale, 0.0f);
-        ggml_tensor * attended = ggml_mul_mat(ctx, V, probs);
-        ggml_tensor * merged = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, attended, 0, 2, 1, 3)), hidden, seq);
-        ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, Wo, merged), bo);
-        ggml_tensor * residual = ggml_add(ctx, x, attn_out);
-        ggml_tensor * n2 = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, residual, ln_eps), n2w), n2b);
-        ggml_tensor * mlp = ggml_add(ctx, ggml_mul_mat(ctx, Wup, n2), bup);
-        mlp = ggml_gelu_erf(ctx, mlp);
-        mlp = ggml_add(ctx, ggml_mul_mat(ctx, ffn_down_w[i], mlp), ffn_down_b[i]);
-        x = ggml_add(ctx, residual, mlp);
-    }
-
-    ggml_tensor * output = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, ln_eps), out_w_r), out_b_r);
-    // The readout tokens are not evenly spaced once padded timesteps drop their observation
-    // groups, so gather them by sequence index rather than striding.
-    ggml_tensor * split_readout = ggml_get_rows(ctx, output, readout_idx);
-    ggml_set_name(split_readout, "bt.readout_action");
-    ggml_set_output(split_readout);
-
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
-    ggml_build_forward_expand(graph, split_readout);
-    ggml_gallocr_t gallocr = rt.alloc(OctoStage::TRANSFORMER);
-    if (!gallocr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
-        std::fprintf(stderr, "vla(octo): transformer ggml_gallocr_alloc_graph failed\n");
-        ggml_free(ctx);
+        ggml_cgraph * gf = ggml_new_graph_custom(C, 8192, false);
+        ggml_build_forward_expand(gf, readout);
+        return gf;
+    });
+    if (!built) {
+        std::fprintf(stderr, "vla(octo): block transformer graph build failed\n");
         return false;
     }
-    ggml_backend_tensor_set(input_t, input.data(), 0, ggml_nbytes(input_t));
-    ggml_backend_tensor_set(mask, blocked_mask.data(), 0, ggml_nbytes(mask));
-    ggml_backend_tensor_set(readout_idx, layout.readout_seq_idx.data(), 0, ggml_nbytes(readout_idx));
-    const ggml_status st = ggml_backend_graph_compute(rt.backend, graph);
-    if (st != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "vla(octo): transformer ggml_backend_graph_compute failed (%d)\n", (int) st);
-        ggml_free(ctx);
-        return false;
-    }
+
+    OctoRuntime::BtIO& io = rt.transformer.io();
+    ggml_backend_tensor_set(io.input, input.data(), 0, ggml_nbytes(io.input));
+    ggml_backend_tensor_set(io.mask, blocked_mask.data(), 0, ggml_nbytes(io.mask));
+    ggml_backend_tensor_set(io.readout_idx, layout.readout_seq_idx.data(), 0, ggml_nbytes(io.readout_idx));
+    if (!octo_compute(rt, rt.transformer.graph(), "block transformer")) return false;
 
     readout_action.resize((size_t) hidden * n_readout);
-    ggml_backend_tensor_get(split_readout, readout_action.data(), 0, ggml_nbytes(split_readout));
-    ggml_free(ctx);
+    ggml_backend_tensor_get(io.out, readout_action.data(), 0, ggml_nbytes(io.out));
     return true;
 }
 
@@ -1669,8 +1606,9 @@ std::unique_ptr<ModelArchBase> octo_create(const std::string& mmproj_path,
     }
     if (!load_config(m->io, *m)) return nullptr;
 
-    m->backend = octo_select_backend(m->n_threads, "");
-    if (!m->backend) return nullptr;
+    const Backend b = backend_init("vla(octo)", m->n_threads);
+    if (!b.handle) return nullptr;
+    m->backend = b.handle;
 
     // TIP-BUILD-OCTO-GPU-B: predict()'s 5 stages now consume these same weights (resident on
     // `m->backend` -- CUDA when available, CPU otherwise) directly; no separate CPU-only copy.
@@ -1717,48 +1655,12 @@ bool octo_tokenize_text(const std::string& ckpt_path,
     return true;
 }
 
-// TIP-ND1-B: sole pipeline implementation (was octo_run_pipeline / _resident, unified). Shared
-// tail of the live/cold-start prediction path: given already-assembled per-view
-// observation+task images (obs.shape={1,window_size,3,side,side}, task.shape={1,3,side,side})
-// and already-tokenized language, runs obs tokenizer x2 -> T5 encoder -> language ->
-// assemble -> causal mask -> block transformer -> diffusion head -> unnormalize, entirely via
-// the resident stage functions on `backend` (the model's real backend: CUDA when available,
-// CPU otherwise), referencing weights resident on `ctx_w` (populated once by load_all_tensors).
-// `io` is the caller's already-open gguf_reader -- unnormalize_action only reads the small
-// in-memory "octo.dataset_statistics" metadata string via it (metadata is parsed once at
-// gguf_reader::open() time, so this is not a disk touch as long as `io` is already open). Used
-// by both octo_predict_from_images (CLI: tokenizes its own instruction via SentencePiece) and
-// OctoModelArch::predict (server: receives already-tokenized Inputs::lang_tokens from the
-// client, matching every other arch's client-tokenizes/server-embeds convention).
-// wrist_real=false marks the wrist observation as a zero-fill placeholder (single-camera
-// checkpoint or a caller that supplied no wrist view) -- its causal-mask key_valid entries
-// are forced false so the transformer treats it as absent padding, not a real observation.
-//
-// TIP-05: has_proprio/proprio_in_dim/proprio_state_raw are additive -- has_proprio=false
-// (every pre-TIP-05 checkpoint) skips Part A entirely (n_proprio=0, byte-identical sequence
-// geometry to before). head_type routes Part B: "l1" runs the L1 action head instead of
-// diffusion (bypassing the whole noise/denoising-loop pipeline per TIP-05's routing spec);
-// "diffusion" keeps the untouched pre-TIP-05 path. The two are independent switches (a
-// checkpoint could in principle have proprio without an L1 head or vice versa; every actual
-// checkpoint pairs them, but nothing here assumes that).
-// Picks the window slots named by `steps` out of a {1, window_size, 3, side, side} buffer.
-static NpyU8 slice_obs_steps(const NpyU8& obs, const std::vector<int32_t>& steps, int side) {
-    const size_t frame = (size_t) 3 * side * side;
-    NpyU8 out;
-    out.shape = {1, (int64_t) steps.size(), 3, side, side};
-    out.data.resize(steps.size() * frame);
-    for (size_t i = 0; i < steps.size(); ++i) {
-        std::copy_n(obs.data.begin() + (ptrdiff_t) ((size_t) steps[i] * frame), frame,
-                    out.data.begin() + (ptrdiff_t) (i * frame));
-    }
-    return out;
-}
-
 static bool octo_run_pipeline(OctoRuntime& rt, gguf_reader& io, int window_size,
                               int action_total, const std::string& head_type,
                               bool has_proprio, int proprio_in_dim,
-                              const NpyU8& primary_obs, const NpyU8& primary_task,
-                              const NpyU8& wrist_obs, const NpyU8& wrist_task, bool wrist_real,
+                              const std::vector<float>& primary_frame,  // [3,256,256] normalized
+                              const std::vector<float>& wrist_frame,    // [3,128,128], empty if absent
+                              bool wrist_real,
                               const std::vector<int32_t>& input_ids,
                               const std::vector<int32_t>& attention_mask,
                               const std::vector<float>& proprio_state_raw,
@@ -1789,16 +1691,30 @@ static bool octo_run_pipeline(OctoRuntime& rt, gguf_reader& io, int window_size,
 
     const auto t_vision0 = clock::now();
     std::vector<float> primary_pos, wrist_pos, proprio_pos;
-    if (!layout.primary_steps.empty()) {
-        NpyU8 obs = slice_obs_steps(primary_obs, layout.primary_steps, 256);
-        if (!run_obs_tokenizer_graph(rt, OctoStage::OBS_PRIMARY, "primary", obs, primary_task, 256, 256,
-                                     (int) layout.primary_steps.size(), layout.primary_steps, primary_pos)) return false;
-    }
-    if (!layout.wrist_steps.empty()) {
-        NpyU8 obs = slice_obs_steps(wrist_obs, layout.wrist_steps, 128);
-        if (!run_obs_tokenizer_graph(rt, OctoStage::OBS_WRIST, "wrist", obs, wrist_task, 128, 64,
-                                     (int) layout.wrist_steps.size(), layout.wrist_steps, wrist_pos)) return false;
-    }
+    // Cold start gives us one live frame per camera, and every live window slot holds that
+    // same frame, so it is replicated rather than re-decoded. No goal image (language-only
+    // conditioning): the task frame is a zero-filled uint8 image, which normalizes to -1.
+    auto tokenize_view = [&](graph_cache<OctoRuntime::ObsKey, OctoRuntime::ObsIO>& cache,
+                             const char * view, const std::vector<float>& frame, int side, int n_tok,
+                             const std::vector<int32_t>& steps, std::vector<float>& out) {
+        const size_t n = (size_t) 3 * side * side;
+        if (frame.size() != n) {
+            std::fprintf(stderr, "vla(octo): %s frame is %zu floats, expected %zu\n", view, frame.size(), n);
+            return false;
+        }
+        std::vector<float> obs(n * steps.size());
+        for (size_t i = 0; i < steps.size(); ++i) {
+            std::copy(frame.begin(), frame.end(), obs.begin() + (ptrdiff_t) (i * n));
+        }
+        const std::vector<float> task(n, -1.0f);
+        return run_obs_tokenizer_graph(rt, cache, view, obs, task, side, n_tok, (int) steps.size(), steps, out);
+    };
+    if (!layout.primary_steps.empty() &&
+        !tokenize_view(rt.obs_primary, "primary", primary_frame, 256, 256, layout.primary_steps, primary_pos))
+        return false;
+    if (!layout.wrist_steps.empty() &&
+        !tokenize_view(rt.obs_wrist, "wrist", wrist_frame, 128, 64, layout.wrist_steps, wrist_pos))
+        return false;
     if (!layout.proprio_steps.empty()) {
         if (!rt.has_proprio_stats) {
             std::fprintf(stderr, "vla(octo): proprio checkpoint but dataset_statistics has no .proprio block\n");
@@ -1858,78 +1774,6 @@ static bool octo_run_pipeline(OctoRuntime& rt, gguf_reader& io, int window_size,
     return unnormalize_action(rt, normalized_out, unnormalized_out);
 }
 
-// Cold start: only ONE live frame is available (a single vla-cli snapshot or server
-// request), but the model expects `window_size` observation timesteps. Repeat the live
-// frame into every slot; the caller's timestep_valid marks all-but-the-last as padding
-// (see octo_run_pipeline_resident) so the causal mask treats only the last slot as "real" -- matches
-// OctoPt's HistoryWrapper.reset() cold start for window_size=2, and generalizes to
-// window_size=1 (no padding slot at all, the single slot IS the live frame). No goal image
-// (language-only conditioning): task is zero-filled, matching OctoModelPt.create_tasks(texts=...).
-static void octo_build_cold_start_obs_task(const uint8_t* rgb, int sw, int sh, int side,
-                                           int window_size, NpyU8& obs, NpyU8& task) {
-    std::vector<uint8_t> frame;
-    resize_to_planar_chw(rgb, sw, sh, side, frame);
-    obs.shape = {1, window_size, 3, side, side};
-    obs.data.resize((size_t) window_size * 3 * side * side);
-    for (int t = 0; t < window_size; ++t) {
-        std::copy(frame.begin(), frame.end(), obs.data.begin() + (ptrdiff_t) t * (ptrdiff_t) frame.size());
-    }
-    task.shape = {1, 3, side, side};
-    task.data.assign((size_t) 3 * side * side, 0);
-}
-
-bool octo_predict_from_images(const std::string& ckpt_path,
-                              const uint8_t* primary_rgb, int primary_w, int primary_h,
-                              const uint8_t* wrist_rgb, int wrist_w, int wrist_h,
-                              const std::string& instruction,
-                              OctoCliAction& out,
-                              const std::string& unnorm_dataset) {
-    gguf_reader g{"octo"};
-    if (!g.open(ckpt_path)) return false;
-    const int window_size = (int) g.u32("octo.window_size");
-    if (window_size < 1 || window_size > kMaxHorizon) {
-        std::fprintf(stderr, "vla(octo): octo.window_size=%d out of supported range [1, %d]\n",
-                     window_size, kMaxHorizon);
-        return false;
-    }
-
-    // TIP-ND1-B: CLI one-shot resident load -- same backend-selection + load_all_tensors
-    // sequence octo_create()/octo_dump_tokenizer_case_resident() use, scoped to this single
-    // call (no persistent OctoModelArch survives past this function, unlike the live server).
-    OctoModelArch m;
-    m.matmul_type = GGML_TYPE_F32;
-    m.action_horizon = g.u32("octo.action.horizon");
-    m.action_dim = g.u32("octo.action.dim");
-    m.head_type = g.has("octo.action.head_type") ? g.str("octo.action.head_type") : "diffusion";
-    detect_proprio(g, m.has_proprio, m.proprio_in_dim);
-    m.backend = octo_select_backend(default_cpu_threads(), "[cli] ");
-    if (!m.backend) return false;
-    if (!load_all_tensors(m, g)) return false;
-    m.rt.init(m.backend, m.ctx_weights);
-
-    std::vector<int32_t> input_ids, attention_mask;
-    if (!octo_tokenize_text(ckpt_path, instruction, input_ids, attention_mask)) return false;
-
-    NpyU8 primary_obs, primary_task, wrist_obs, wrist_task;
-    octo_build_cold_start_obs_task(primary_rgb, primary_w, primary_h, 256, window_size, primary_obs, primary_task);
-    octo_build_cold_start_obs_task(wrist_rgb, wrist_w, wrist_h, 128, window_size, wrist_obs, wrist_task);
-
-    // TIP-05: octo_predict_from_images (the images-only CLI entry point, octo.h) has no
-    // proprio parameter -- an L1/proprio checkpoint driven from the CLI gets an all-zero
-    // proprio reading (z-scored to (0-mean)/std, NOT world-unit zero) rather than a real
-    // robot state. Fine for the CLI's smoke-test purpose; the server path (predict() below)
-    // is what actually threads Inputs::state through.
-    const std::vector<float> proprio_state_raw;
-
-    float ms_vision = 0.f, ms_inference = 0.f;
-    const int action_total = (int) (m.action_horizon * m.action_dim);
-    return octo_run_pipeline(m.rt, g, window_size, action_total, m.head_type,
-                             m.has_proprio, (int) m.proprio_in_dim,
-                             primary_obs, primary_task, wrist_obs, wrist_task,
-                             /*wrist_real=*/true, input_ids, attention_mask, proprio_state_raw, unnorm_dataset,
-                             out.normalized, out.unnormalized, ms_vision, ms_inference);
-}
-
 // Server-facing entry point (vla-server, TIP-CLIENT): in.images[0] is the primary view,
 // in.images[1] the wrist view if the client sent one (single-camera checkpoints/clients
 // omit it -- zero-filled and masked invalid via octo_run_pipeline_resident's wrist_real=false, same
@@ -1948,16 +1792,7 @@ std::vector<float> OctoModelArch::predict(const Inputs& in) {
         std::fprintf(stderr, "vla(octo): predict needs at least 1 image (primary)\n");
         return {};
     }
-    if (in.images[0].format != PixelFormat::U8) {
-        std::fprintf(stderr, "vla(octo): predict only supports PixelFormat::U8 images "
-                              "(client must send RGB_U8, already rotated+resized -- TIP-P)\n");
-        return {};
-    }
     const bool wrist_real = in.n_images >= 2;
-    if (wrist_real && in.images[1].format != PixelFormat::U8) {
-        std::fprintf(stderr, "vla(octo): predict only supports PixelFormat::U8 images\n");
-        return {};
-    }
     if (in.n_lang != (int) language_tokens || in.attention_mask_n != (int) language_tokens || !in.attention_mask) {
         std::fprintf(stderr,
                      "vla(octo): predict expects lang_tokens AND attention_mask of exactly %lld "
@@ -1969,24 +1804,13 @@ std::vector<float> OctoModelArch::predict(const Inputs& in) {
         return {};
     }
 
-    // TIP-BUILD-OCTO-GPU-B: no per-call GGUF reopen -- weights are resident on `backend`
-    // (loaded once in octo_create via load_all_tensors), and the 5 stages now compute on
-    // that same real backend (CUDA when available, CPU otherwise) instead of a fresh
-    // per-call CPU backend. `io` (opened once in octo_create too) covers the one remaining
-    // in-memory metadata read (octo.dataset_statistics, inside unnormalize_action).
-
-    NpyU8 primary_obs, primary_task, wrist_obs, wrist_task;
-    octo_build_cold_start_obs_task((const uint8_t*) in.images[0].data, in.images[0].w, in.images[0].h,
-                                   256, (int) window_size, primary_obs, primary_task);
-    if (wrist_real) {
-        octo_build_cold_start_obs_task((const uint8_t*) in.images[1].data, in.images[1].w, in.images[1].h,
-                                       128, (int) window_size, wrist_obs, wrist_task);
-    } else {
-        wrist_obs.shape = {1, window_size, 3, 128, 128};
-        wrist_obs.data.assign((size_t) window_size * 3 * 128 * 128, 0);
-        wrist_task.shape = {1, 3, 128, 128};
-        wrist_task.data.assign((size_t) 3 * 128 * 128, 0);
-    }
+    // Weights, the graph caches and the gguf_reader are all resident from octo_create; a
+    // frame only uploads its own inputs.
+    std::vector<float> primary_frame, wrist_frame;
+    if (!octo_prepare_view(in.images[0], 256, primary_frame)) return {};
+    // A wrist view we were not given is left out of the sequence entirely rather than
+    // zero-filled and masked -- see build_seq_layout.
+    if (wrist_real && !octo_prepare_view(in.images[1], 128, wrist_frame)) return {};
 
     const std::vector<int32_t> input_ids(in.lang_tokens, in.lang_tokens + in.n_lang);
     const std::vector<int32_t> attention_mask(in.attention_mask, in.attention_mask + in.attention_mask_n);
@@ -2014,7 +1838,7 @@ std::vector<float> OctoModelArch::predict(const Inputs& in) {
     const int action_total = (int) (action_horizon * action_dim);
     if (!octo_run_pipeline(rt, io, (int) window_size, action_total, head_type,
                            has_proprio, (int) proprio_in_dim,
-                           primary_obs, primary_task, wrist_obs, wrist_task,
+                           primary_frame, wrist_frame,
                            wrist_real, input_ids, attention_mask, proprio_state_raw, /*unnorm_dataset=*/"",
                            normalized, unnormalized, ms_vision, ms_inference)) {
         return {};
